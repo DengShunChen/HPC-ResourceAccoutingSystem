@@ -43,6 +43,9 @@ venv/
 ENV/
 env/
 
+# Data files
+data/
+
 # Database
 *.db
 *.sqlite3
