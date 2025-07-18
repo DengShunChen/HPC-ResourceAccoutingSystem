@@ -1,0 +1,58 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+#  Usually these files are created by a PyInstaller executable; adding them to
+#  .gitignore so that people can run it without getting their repository dirty.
+*.manifest
+*.spec
+
+# Pytest
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+.tox
+
+# Environments
+.env
+.venv
+venv/
+ENV/
+env/
+
+# Database
+*.db
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# Log files
+cron.log
+nohup.out
+
+# IDE / Editor specific
+.idea/
+.vscode/

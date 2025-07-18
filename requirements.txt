@@ -1,0 +1,9 @@
+streamlit
+typer
+pandas
+SQLAlchemy
+redis
+pytest
+alembic
+python-dotenv
+passlib[bcrypt]
