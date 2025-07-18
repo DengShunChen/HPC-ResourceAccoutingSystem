@@ -9,7 +9,7 @@
 *   **應用程式框架 (GUI)**: Streamlit
 *   **應用程式框架 (CLI)**: Typer
 *   **資料庫**: SQLite (檔案型資料庫)
-*   **資料庫版本控制**: Alembic (待實作)
+*   **資料庫版本控制**: Alembic
 *   **快取**: Redis
 *   **測試框架**: Pytest
 *   **核心邏輯**: Python (Pandas, SQLAlchemy)
@@ -17,15 +17,18 @@
 ## 資料庫綱要
 
 *   `jobs`: 儲存處理過的日誌資料。
+*   `wallets`: 儲存錢包資訊。
 *   `users`: 儲存使用者帳戶資訊。
 *   `quotas`: 儲存帳戶的資源使用額度。
-*   `group_mappings`: 儲存群組至帳戶的對應例外規則。
 *   `processed_files`: 記錄已載入的檔案及其校驗和。
+*   `group_to_group_mappings`: 儲存群組到群組的對應規則。
+*   `group_to_wallet_mappings`: 儲存群組到錢包的對應規則。
+*   `user_to_wallet_mappings`: 儲存使用者到錢包的對應規則。
 *   `alembic_version`: (由 Alembic 自動管理) 追蹤資料庫版本。
 
 ## 開發與部署指南
 
-### 1. 環境設定與初始化
+### 1. 本地開發環境設定
 
 1.  **安裝環境需求**:
     *   確保系統已安裝 Python 3.8+。
@@ -54,30 +57,22 @@
     pip install -r requirements.txt
     ```
 
-5.  **初始化資料庫**:
-    這將會建立 `resource_accounting.db` 檔案及所有必要的資料表。
+5.  **初始化/升級資料庫**:
+    這將會根據 `database.py` 中的模型和 Alembic 遷移腳本，建立或更新 `resource_accounting.db` 檔案及所有必要的資料表。
 
     ```bash
-    python database.py
+    alembic upgrade head
     ```
-
-6.  **建立初始管理員帳號 (CLI)**:
-    首次運行時，您可以透過 CLI 建立一個管理員帳號。
-
-    ```bash
-    python auth.py
-    ```
-    按照提示輸入管理員使用者名稱和密碼。
 
 ### 2. 運行應用程式
 
-#### 2.1. 運行 Streamlit GUI
+#### 2.1. 運行 Streamlit GUI (網頁介面)
 
 ```bash
-streamlit run app.py
+streamlit run 系統登入.py
 ```
 
-#### 2.2. 運行 Typer CLI
+#### 2.2. 運行 Typer CLI (命令列介面)
 
 ```bash
 python cli.py --help
@@ -90,6 +85,7 @@ python cli.py --help
 
 ```bash
 python data_loader.py
+# 預設會掃描新檔案。若要強制重新載入特定檔案，請參考 data_loader.py 腳本內的說明。
 ```
 
 ### 4. 運行測試
@@ -98,34 +94,48 @@ python data_loader.py
 PYTHONPATH=. pytest
 ```
 
+### 5. 叢集部署
+
+有關如何將應用程式部署到叢集的詳細步驟，請參考 `DEPLOY.md` 文件。
+
 ## 專案結構
 
 ```
 .env                  # 環境變數 (不提交到版本控制)
 .env.example          # 環境變數範例
-app.py                # Streamlit GUI 主程式
+.gitignore            # Git 忽略文件
+DEPLOY.md             # 叢集部署指南
+GEMINI.md             # 專案開發藍圖與筆記
+README.md             # 專案說明文件
+alembic.ini           # Alembic 配置檔
+alembic/              # Alembic 資料庫遷移腳本目錄
+├── env.py
+├── script.py.mako
+└── versions/         # 遷移版本文件
+    └── <timestamp>_<migration_name>.py
 auth.py               # 使用者認證與授權邏輯
-cli.py                # Typer CLI 主程式 (待實作)
+clearJobs.sh          # 清除任務資料的腳本
+cli.py                # Typer CLI 主程式
 config.ini            # 應用程式配置
 data_loader.py        # 日誌資料載入與轉換邏輯
 database.py           # 資料庫模型與連線設定
-GEMINI.md             # 專案開發藍圖與筆記
+list_users.py         # 列出使用者的腳本
+pages/                # Streamlit 頁面檔案
+├── 1_📊_儀表板資訊.py
+├── 2_📈_詳細統計資訊.py
+└── 3_⚙️_管理者控制台.py
 queries.py            # 資料庫查詢功能
 requirements.txt      # Python 相依套件列表
-resource_accounting.db # SQLite 資料庫檔案 (自動生成)
-__pycache__/          # Python 編譯快取
-data/                 # 存放原始日誌檔的目錄
-pages/                # Streamlit 頁面檔案
-├── 1_📊_User_Dashboard.py
-└── 2_⚙️_Admin_Panel.py
+resource_accounting.db # SQLite 資料庫檔案 (自動生成，已在 .gitignore 中)
 setup_scripts/        # 設定腳本
-├── setup_macos.sh    # macOS 設定腳本 (待實作)
+└── setup_macos.sh    # macOS 設定腳本
 tests/                # 單元測試
 ├── test_auth.py
-├── test_database.py
 ├── test_data_loader.py
+├── test_database.py
 └── test_queries.py
-venv/                 # Python 虛擬環境
+venv/                 # Python 虛擬環境 (已在 .gitignore 中)
+系統登入.py             # Streamlit GUI 登入主程式
 ```
 
 ## 擴展性考量
@@ -143,4 +153,4 @@ venv/                 # Python 虛擬環境
 2.  建立您的功能分支 (`git checkout -b feature/AmazingFeature`).
 3.  提交您的變更 (`git commit -m 'Add some AmazingFeature'`).
 4.  推送到分支 (`git push origin feature/AmazingFeature`).
-5.  開啟一個 Pull Request。
+5.  開啟一個 Pull Request.
