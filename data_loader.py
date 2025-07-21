@@ -171,7 +171,7 @@ def load_new_data(db: Session = None, specific_file: str = None, force: bool = F
                 print("Existing data for jobs deleted.")
 
             try:
-                raw_df = pd.read_csv(file_path, delim_whitespace=True, header=None, names=column_names, on_bad_lines='skip')
+                raw_df = pd.read_csv(file_path, sep='\\s+', header=None, names=column_names, on_bad_lines='skip', engine='python')
                 raw_df['source_file'] = filename
                 
                 clean_df = transform_data(raw_df, db)
