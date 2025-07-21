@@ -31,7 +31,7 @@ def create_donut_chart(df, theta_col, color_col, title, color_range, tooltip_ove
      chart = alt.Chart(df).mark_arc(outerRadius=110, innerRadius=60).encode(
          theta=alt.Theta(field=theta_col, type="quantitative"),
          color=alt.Color(field=color_col, type="nominal", title="圖例", scale=color_scale),
-         order=alt.Order(field=theta_col, sort="descending"),
+         order=alt.Order(field=color_col, sort="descending"),
          tooltip=tooltip
      ).properties(title=title).configure_title(
          fontSize=24,
