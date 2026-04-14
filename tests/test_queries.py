@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, date
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from database import Base, Job, User, Quota, GroupMapping
-from queries import get_kpi_data, get_usage_over_time, get_filtered_jobs, get_all_users, get_all_groups, get_all_queues,     get_all_registered_users, get_user_quota, set_user_quota, delete_user, get_all_group_mappings, add_group_mapping, delete_group_mapping,     generate_accounting_report
+from queries import get_kpi_data, get_usage_over_time, get_filtered_jobs, get_all_users, get_all_groups, get_all_queues,     get_all_registered_users, get_user_quota, set_user_quota, delete_user, get_all_group_mappings, add_group_mapping, delete_group_mapping,     generate_accounting_report, get_user_resource_usage_summary
 from unittest.mock import patch, MagicMock
 import pandas as pd
 
@@ -169,3 +169,92 @@ def test_generate_accounting_report(in_memory_db, populate_jobs):
     assert isinstance(report, pd.DataFrame)
     assert not report.empty
     assert len(report) == 2 # userA has 2 jobs in July 2025
+
+
+def test_get_user_resource_usage_summary_non_admin_forced_self(in_memory_db, populate_jobs):
+    """非 admin 時 subject_user_name 會被忽略，僅能看 viewer_username。"""
+    rows = get_user_resource_usage_summary(
+        in_memory_db,
+        date(2025, 7, 1),
+        date(2025, 7, 31),
+        viewer_role="user",
+        viewer_username="userA",
+        subject_user_name="userB",
+        time_granularity="daily",
+    )
+    periods = {r["period"] for r in rows}
+    assert "2025-07-01" in periods
+    assert "2025-07-03" not in periods
+
+
+def test_get_user_resource_usage_summary_admin_all_cluster(in_memory_db, populate_jobs):
+    rows = get_user_resource_usage_summary(
+        in_memory_db,
+        date(2025, 7, 1),
+        date(2025, 7, 3),
+        viewer_role="admin",
+        viewer_username="admin_user",
+        subject_user_name=None,
+        time_granularity="daily",
+    )
+    jul1 = next(r for r in rows if r["period"] == "2025-07-01")
+    assert jul1["job_count"] == 2
+
+
+def test_get_user_resource_usage_summary_admin_specific_user(in_memory_db, populate_jobs):
+    rows = get_user_resource_usage_summary(
+        in_memory_db,
+        date(2025, 7, 1),
+        date(2025, 7, 3),
+        viewer_role="admin",
+        viewer_username="admin_user",
+        subject_user_name="userC",
+        time_granularity="daily",
+    )
+    assert len(rows) == 1
+    assert rows[0]["period"] == "2025-07-03"
+    assert rows[0]["job_count"] == 1
+    expected_cpu_h = 150 / 3600.0
+    assert abs(rows[0]["cpu_node_hours"] - expected_cpu_h) < 1e-9
+
+
+def test_get_user_resource_usage_summary_empty_range(in_memory_db, populate_jobs):
+    rows = get_user_resource_usage_summary(
+        in_memory_db,
+        date(2020, 1, 1),
+        date(2020, 1, 2),
+        viewer_role="user",
+        viewer_username="userA",
+        time_granularity="daily",
+    )
+    assert rows == []
+
+
+def test_get_user_resource_usage_summary_usera_daily_hours(in_memory_db, populate_jobs):
+    rows = get_user_resource_usage_summary(
+        in_memory_db,
+        date(2025, 7, 1),
+        date(2025, 7, 3),
+        viewer_role="user",
+        viewer_username="userA",
+        time_granularity="daily",
+    )
+    by_p = {r["period"]: r for r in rows}
+    assert abs(by_p["2025-07-01"]["cpu_node_hours"] - 100 / 3600.0) < 1e-9
+    assert abs(by_p["2025-07-01"]["gpu_core_hours"] - 0.0) < 1e-9
+    assert abs(by_p["2025-07-02"]["cpu_node_hours"] - 100 / 3600.0) < 1e-9
+
+
+def test_get_user_resource_usage_summary_monthly_admin(in_memory_db, populate_jobs):
+    rows = get_user_resource_usage_summary(
+        in_memory_db,
+        date(2025, 7, 1),
+        date(2025, 7, 31),
+        viewer_role="admin",
+        viewer_username="admin_user",
+        subject_user_name="(全體)",
+        time_granularity="monthly",
+    )
+    assert len(rows) == 1
+    assert rows[0]["period"] == "2025-07"
+    assert rows[0]["job_count"] == 4

@@ -134,6 +134,7 @@ _REPORT_CACHE_KEY_PREFIXES = (
     "get_first_job_date:",
     "get_last_job_date:",
     "generate_accounting_report:",
+    "get_user_resource_usage_summary:",
 )
 
 
@@ -286,6 +287,76 @@ def get_usage_over_time(db: Session, start_date: date, end_date: date, user_name
         'resource_type': r.resource_type,
         'daily_node_seconds': r.daily_resource_seconds or 0
     } for r in results]
+
+
+@cache_results(ttl_seconds=600)
+def get_user_resource_usage_summary(
+    db: Session,
+    start_date: date,
+    end_date: date,
+    viewer_role: str,
+    viewer_username: str,
+    subject_user_name: str = None,
+    time_granularity: str = "daily",
+):
+    """
+    依期間彙總 CPU 節點小時、GPU 核心小時與作業筆數（用於日常報表）。
+
+    權限：非 admin 一律僅能查詢 viewer_username，忽略傳入的 subject_user_name。
+    管理員可傳 subject_user_name 為具體帳號；None、空字串或「(全體)」表示全叢集不按使用者篩選。
+    """
+    if viewer_role != "admin":
+        subject_user_name = viewer_username
+
+    tg = (time_granularity or "daily").lower()
+    if tg == "monthly":
+        period_label = func.strftime("%Y-%m", Job.start_time).label("period")
+    elif tg == "weekly":
+        # SQLite concat 多參數需較新版本；巢狀 2 參數相容舊版
+        period_label = func.concat(
+            func.strftime("%Y", Job.start_time),
+            func.concat("-W", func.strftime("%W", Job.start_time)),
+        ).label("period")
+    else:
+        tg = "daily"
+        period_label = func.strftime("%Y-%m-%d", Job.start_time).label("period")
+
+    cpu_sec = case((Job.resource_type == "CPU", Job.run_time_seconds * Job.nodes), else_=0)
+    gpu_sec = case((Job.resource_type == "GPU", Job.run_time_seconds * Job.cores), else_=0)
+
+    q = (
+        db.query(
+            period_label,
+            func.sum(cpu_sec).label("cpu_seconds"),
+            func.sum(gpu_sec).label("gpu_seconds"),
+            func.count(Job.id).label("job_count"),
+        )
+        .filter(
+            Job.start_time >= start_date,
+            Job.start_time < (end_date + timedelta(days=1)),
+        )
+    )
+
+    if subject_user_name and str(subject_user_name).strip() not in ("(全體)", "(全部)", ""):
+        q = q.filter(Job.user_name == subject_user_name)
+
+    q = q.group_by(period_label).order_by(period_label)
+    rows = q.all()
+    out = []
+    for r in rows:
+        p = r.period
+        if p is None:
+            continue
+        out.append(
+            {
+                "period": str(p),
+                "cpu_node_hours": float((r.cpu_seconds or 0) / 3600.0),
+                "gpu_core_hours": float((r.gpu_seconds or 0) / 3600.0),
+                "job_count": int(r.job_count or 0),
+            }
+        )
+    return out
+
 
 @cache_results(ttl_seconds=300)
 def get_filtered_jobs(db: Session, page: int = 1, page_size: int = 20,
