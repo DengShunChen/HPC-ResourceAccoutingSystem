@@ -1,7 +1,9 @@
 import os
+from contextlib import contextmanager
+
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, BigInteger, Float, Boolean, ForeignKey, Index
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import sessionmaker, relationship, declarative_base
+from sqlalchemy.pool import NullPool
 from dotenv import load_dotenv
 from sqlalchemy import text # Moved to top
 
@@ -13,9 +15,7 @@ load_dotenv()
 DATABASE_FILE = os.getenv("DATABASE_FILE", "./resource_accounting.db")
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
-# Optimize engine with connection pooling
-# Set busy_timeout for all new connections via connect_args
-# This ensures all connections have the timeout set for better concurrency
+# SQLite 檔案庫：使用 NullPool 避免不適用的小連線池堆疊；每次請求新連線、用完即關
 engine = create_engine(
     DATABASE_URL,
     connect_args={
@@ -23,9 +23,7 @@ engine = create_engine(
         "timeout": 5.0  # SQLite busy timeout in seconds (helps with concurrent access)
     },
     pool_pre_ping=True,
-    pool_size=10,  # Connection pool size
-    max_overflow=20,  # Maximum overflow connections
-    pool_recycle=3600,  # Recycle connections after 1 hour
+    poolclass=NullPool,
     echo=False  # Set to False in production
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -145,6 +143,16 @@ class UserToWalletMapping(Base):
     user = relationship("User") # Added relationship
 
 def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def db_session_scope():
+    """非產生器版 Session，供 Streamlit 等以 `with db_session_scope() as db:` 確保 close。"""
     db = SessionLocal()
     try:
         yield db

@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import configparser
 import hashlib
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from database import SessionLocal, Job, ProcessedFile, GroupMapping, User, GroupToGroupMapping, Wallet
@@ -14,6 +15,19 @@ from auth import get_password_hash
 
 # 單檔大量寫入時分段 commit，避免單一交易過大與 ORM 物件過多
 _JOB_INSERT_CHUNK = 5000
+_JOB_ID_YIELD_PER = 8000
+
+
+def _analyze_jobs_table(db: Session) -> None:
+    """大量寫入後於**目前 Session 所綁定之資料庫**執行 ANALYZE（測試 in-memory 與正式檔案庫皆正確）。"""
+    try:
+        bind = db.get_bind()
+        with bind.connect() as conn:
+            conn.execute(text("ANALYZE jobs"))
+            conn.commit()
+    except Exception as e:
+        print(f"ANALYZE jobs skipped: {e}")
+
 
 def get_config():
     config = configparser.ConfigParser()
@@ -236,8 +250,10 @@ def load_new_data(db: Session = None, specific_file: str = None, force: bool = F
                 if clean_df.empty:
                     print(f"No valid data found in {filename} after transformation.")
                 else:
-                    # Get existing job_ids from the database for the current source_file
-                    existing_job_ids = {job[0] for job in db.query(Job.job_id).filter(Job.source_file == filename).all()}
+                    # Get existing job_ids from the database for the current source_file（yield_per 降低單次載入尖峰）
+                    existing_job_ids = set()
+                    for row in db.query(Job.job_id).filter(Job.source_file == filename).yield_per(_JOB_ID_YIELD_PER):
+                        existing_job_ids.add(row.job_id)
                     
                     # Filter out jobs that already exist in the database for this source_file
                     jobs_to_add_df = clean_df[~clean_df['job_id'].isin(existing_job_ids)]
@@ -273,6 +289,7 @@ def load_new_data(db: Session = None, specific_file: str = None, force: bool = F
                             db.add_all(jobs_to_add[i : i + _JOB_INSERT_CHUNK])
                             db.commit()
                         print(f"Successfully loaded {len(jobs_to_add)} new jobs from {filename}.")
+                        _analyze_jobs_table(db)
 
                 # Update or create ProcessedFile entry
                 current_checksum = calculate_checksum(file_path)

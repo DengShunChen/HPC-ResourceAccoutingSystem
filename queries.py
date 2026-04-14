@@ -131,10 +131,13 @@ _REPORT_CACHE_KEY_PREFIXES = (
     "get_all_groups:",
     "get_all_queues:",
     "get_all_wallets:",
+    "_get_job_start_date_bounds_cached:",
+    "get_job_start_date_bounds:",
     "get_first_job_date:",
     "get_last_job_date:",
     "generate_accounting_report:",
-    "get_user_resource_usage_summary:",
+    "get_user_resource_usage_summary:",  # 舊版快取鍵（TTL 內仍可能存在）
+    "_get_user_resource_usage_summary_cached:",
 )
 
 
@@ -153,15 +156,35 @@ def invalidate_report_caches() -> None:
 
 
 # --- Helper Functions ---
+def _cpu_node_seconds_product():
+    """CPU：run_time × nodes（單一公式來源，供 KPI 以外聚合共用）。"""
+    return Job.run_time_seconds * Job.nodes
+
+
+def _gpu_core_seconds_product():
+    """GPU：run_time × cores。"""
+    return Job.run_time_seconds * Job.cores
+
+
+def _get_cpu_node_seconds_expression():
+    """僅 CPU 列之節點秒數，其餘資源型別為 0。"""
+    return case((Job.resource_type == "CPU", _cpu_node_seconds_product()), else_=0)
+
+
+def _get_gpu_core_seconds_expression():
+    """僅 GPU 列之核心秒數，其餘資源型別為 0。"""
+    return case((Job.resource_type == "GPU", _gpu_core_seconds_product()), else_=0)
+
+
 def _get_resource_seconds_expression():
     """
     Returns the SQLAlchemy CASE expression for calculating resource-seconds.
     It calculates node-seconds for CPU and core-seconds for GPU.
     """
     return case(
-        (Job.resource_type == 'CPU', Job.run_time_seconds * Job.nodes),
-        (Job.resource_type == 'GPU', Job.run_time_seconds * Job.cores),
-        else_=0
+        (Job.resource_type == "CPU", _cpu_node_seconds_product()),
+        (Job.resource_type == "GPU", _gpu_core_seconds_product()),
+        else_=0,
     )
 
 # --- Query Functions ---
@@ -289,7 +312,6 @@ def get_usage_over_time(db: Session, start_date: date, end_date: date, user_name
     } for r in results]
 
 
-@cache_results(ttl_seconds=600)
 def get_user_resource_usage_summary(
     db: Session,
     start_date: date,
@@ -302,27 +324,58 @@ def get_user_resource_usage_summary(
     """
     依期間彙總 CPU 節點小時、GPU 核心小時與作業筆數（用於日常報表）。
 
-    權限：非 admin 一律僅能查詢 viewer_username，忽略傳入的 subject_user_name。
-    管理員可傳 subject_user_name 為具體帳號；None、空字串或「(全體)」表示全叢集不按使用者篩選。
-    """
-    if viewer_role != "admin":
-        subject_user_name = viewer_username
+    權限：非 admin（角色不分大小寫）一律僅能查詢 viewer_username，忽略傳入的 subject_user_name。
+    管理員可傳 subject_user_name 為具體帳號；None、空字串或「(全體)/(全部)」表示全叢集不按使用者篩選。
 
+    快取建於已正規化參數之內層函式，避免相同邏輯查詢因多餘 kwargs 產生重複 Redis 鍵。
+    """
+    role_norm = (viewer_role or "").strip().lower()
+    if role_norm != "admin":
+        subject_norm = viewer_username
+    else:
+        if subject_user_name is None:
+            subject_norm = None
+        else:
+            s = str(subject_user_name).strip()
+            subject_norm = None if s in ("(全體)", "(全部)", "") else s
+
+    return _get_user_resource_usage_summary_cached(
+        db,
+        start_date,
+        end_date,
+        role_norm,
+        viewer_username,
+        subject_norm,
+        time_granularity,
+    )
+
+
+@cache_results(ttl_seconds=600)
+def _get_user_resource_usage_summary_cached(
+    db: Session,
+    start_date: date,
+    end_date: date,
+    viewer_role: str,
+    viewer_username: str,
+    subject_user_name: str = None,
+    time_granularity: str = "daily",
+):
+    """內層：參數已由 get_user_resource_usage_summary 正規化；viewer_role 為小寫 'admin' 或 'user' 等。"""
     tg = (time_granularity or "daily").lower()
     if tg == "monthly":
         period_label = func.strftime("%Y-%m", Job.start_time).label("period")
     elif tg == "weekly":
-        # SQLite concat 多參數需較新版本；巢狀 2 參數相容舊版
+        # SQLite：%G/%V 為 ISO 8601 週曆年與週次（3.34+）；concat 巢狀以相容舊版 2 參數 concat
         period_label = func.concat(
-            func.strftime("%Y", Job.start_time),
-            func.concat("-W", func.strftime("%W", Job.start_time)),
+            func.strftime("%G", Job.start_time),
+            func.concat("-W", func.strftime("%V", Job.start_time)),
         ).label("period")
     else:
         tg = "daily"
         period_label = func.strftime("%Y-%m-%d", Job.start_time).label("period")
 
-    cpu_sec = case((Job.resource_type == "CPU", Job.run_time_seconds * Job.nodes), else_=0)
-    gpu_sec = case((Job.resource_type == "GPU", Job.run_time_seconds * Job.cores), else_=0)
+    cpu_sec = _get_cpu_node_seconds_expression()
+    gpu_sec = _get_gpu_core_seconds_expression()
 
     q = (
         db.query(
@@ -337,7 +390,7 @@ def get_user_resource_usage_summary(
         )
     )
 
-    if subject_user_name and str(subject_user_name).strip() not in ("(全體)", "(全部)", ""):
+    if subject_user_name:
         q = q.filter(Job.user_name == subject_user_name)
 
     q = q.group_by(period_label).order_by(period_label)
@@ -358,22 +411,18 @@ def get_user_resource_usage_summary(
     return out
 
 
-@cache_results(ttl_seconds=300)
-def get_filtered_jobs(db: Session, page: int = 1, page_size: int = 20,
-                      start_date: date = None, end_date: date = None,
-                      user_name: str = None, user_group: str = None,
-                      queue: str = None, resource_type: str = None, wallet_name: str = None,
-                      last_id: int = None, include_total: bool = True):
-    """Gets a paginated list of jobs with filters.
-    
-    Args:
-        last_id: Cursor 分頁時傳上一頁最後一筆的 id；依主鍵遞增續撈。傳 0 表示從頭（id>0）。
-                 若為 None 則使用 OFFSET 分頁（排序為 start_time desc, id desc）。
-        include_total: 若為 False，不執行 COUNT（儀表板僅顯示列表時可省一次全表掃描）。
-    """
+def _filtered_jobs_query(
+    db: Session,
+    start_date: date = None,
+    end_date: date = None,
+    user_name: str = None,
+    user_group: str = None,
+    queue: str = None,
+    resource_type: str = None,
+    wallet_name: str = None,
+):
+    """與 get_filtered_jobs 相同篩選條件之基底查詢（未排序、未分頁）。"""
     query = db.query(Job)
-
-    # Apply filters
     if start_date:
         query = query.filter(Job.start_time >= start_date)
     if end_date:
@@ -388,6 +437,55 @@ def get_filtered_jobs(db: Session, page: int = 1, page_size: int = 20,
         query = query.filter(Job.resource_type == resource_type)
     if wallet_name and wallet_name != "(全部)":
         query = query.filter(Job.wallet_name == wallet_name)
+    return query
+
+
+def count_filtered_jobs(
+    db: Session,
+    start_date: date = None,
+    end_date: date = None,
+    user_name: str = None,
+    user_group: str = None,
+    queue: str = None,
+    resource_type: str = None,
+    wallet_name: str = None,
+) -> int:
+    """精確計算符合篩選的作業筆數（不快取；供按需載入總筆數）。"""
+    return _filtered_jobs_query(
+        db,
+        start_date=start_date,
+        end_date=end_date,
+        user_name=user_name,
+        user_group=user_group,
+        queue=queue,
+        resource_type=resource_type,
+        wallet_name=wallet_name,
+    ).count()
+
+
+@cache_results(ttl_seconds=300)
+def get_filtered_jobs(db: Session, page: int = 1, page_size: int = 20,
+                      start_date: date = None, end_date: date = None,
+                      user_name: str = None, user_group: str = None,
+                      queue: str = None, resource_type: str = None, wallet_name: str = None,
+                      last_id: int = None, include_total: bool = True):
+    """Gets a paginated list of jobs with filters.
+    
+    Args:
+        last_id: Cursor 分頁時傳上一頁最後一筆的 id；依主鍵遞增續撈。傳 0 表示從頭（id>0）。
+                 若為 None 則使用 OFFSET 分頁（排序為 start_time desc, id desc）。
+        include_total: 若為 False，不執行 COUNT（儀表板僅顯示列表時可省一次全表掃描）。
+    """
+    query = _filtered_jobs_query(
+        db,
+        start_date=start_date,
+        end_date=end_date,
+        user_name=user_name,
+        user_group=user_group,
+        queue=queue,
+        resource_type=resource_type,
+        wallet_name=wallet_name,
+    )
 
     if last_id is not None:
         query = query.filter(Job.id > last_id).order_by(Job.id)
@@ -907,21 +1005,36 @@ def get_peak_usage_heatmap(db: Session, start_date: date, end_date: date, user_n
     results = query.all()
     return [{'day_of_week': r.day_of_week, 'hour_of_day': r.hour_of_day, 'job_count': r.job_count} for r in results]
 
-@cache_results(ttl_seconds=3600) # Cache for an hour
+@cache_results(ttl_seconds=3600)
+def _get_job_start_date_bounds_cached(db: Session) -> dict:
+    """內層：回傳 JSON 可序列化 dict，避免 Redis 還原後 date 型別遺失。"""
+    row = db.query(func.min(Job.start_time), func.max(Job.start_time)).one()
+    lo, hi = row[0], row[1]
+    if not lo or not hi:
+        today = date.today().isoformat()
+        return {"lo": today, "hi": today}
+    lo_d = _start_time_bound_to_date(lo)
+    hi_d = _start_time_bound_to_date(hi)
+    return {"lo": lo_d.isoformat(), "hi": hi_d.isoformat()}
+
+
+def get_job_start_date_bounds(db: Session) -> tuple:
+    """單次查詢 jobs 的最早與最晚 start_time（轉為 date）。快取一筆以降低 round-trip。"""
+    d = _get_job_start_date_bounds_cached(db)
+    return (
+        date.fromisoformat(str(d["lo"])[:10]),
+        date.fromisoformat(str(d["hi"])[:10]),
+    )
+
+
 def get_first_job_date(db: Session) -> date:
     """Gets the earliest job start date from the database."""
-    first_job_date = db.query(func.min(Job.start_time)).scalar()
-    if not first_job_date:
-        return date.today()
-    return _start_time_bound_to_date(first_job_date)
+    return get_job_start_date_bounds(db)[0]
 
-@cache_results(ttl_seconds=3600) # Cache for an hour
+
 def get_last_job_date(db: Session) -> date:
     """Gets the latest job start date from the database."""
-    last_job_date = db.query(func.max(Job.start_time)).scalar()
-    if not last_job_date:
-        return date.today()
-    return _start_time_bound_to_date(last_job_date)
+    return get_job_start_date_bounds(db)[1]
 
 @cache_results(ttl_seconds=300)
 def get_failure_rate_by_group(db: Session, start_date: date, end_date: date, limit: int = 10):

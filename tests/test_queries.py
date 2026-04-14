@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, date
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from database import Base, Job, User, Quota, GroupMapping
-from queries import get_kpi_data, get_usage_over_time, get_filtered_jobs, get_all_users, get_all_groups, get_all_queues,     get_all_registered_users, get_user_quota, set_user_quota, delete_user, get_all_group_mappings, add_group_mapping, delete_group_mapping,     generate_accounting_report, get_user_resource_usage_summary
+from queries import get_kpi_data, get_usage_over_time, get_filtered_jobs, count_filtered_jobs, get_all_users, get_all_groups, get_all_queues,     get_all_registered_users, get_user_quota, set_user_quota, delete_user, get_all_group_mappings, add_group_mapping, delete_group_mapping,     generate_accounting_report, get_user_resource_usage_summary, get_job_start_date_bounds
 from unittest.mock import patch, MagicMock
 import pandas as pd
 
@@ -58,6 +58,22 @@ def populate_jobs(in_memory_db):
     in_memory_db.query(Quota).delete()
     in_memory_db.query(GroupMapping).delete()
     in_memory_db.commit()
+
+def test_get_job_start_date_bounds(in_memory_db, populate_jobs):
+    lo, hi = get_job_start_date_bounds(in_memory_db)
+    assert lo <= hi
+    assert lo.year == 2025
+    assert hi.month == 7
+
+
+def test_count_filtered_jobs(in_memory_db, populate_jobs):
+    n = count_filtered_jobs(in_memory_db, date(2025, 7, 1), date(2025, 7, 3))
+    assert n == 4
+    n_usera = count_filtered_jobs(
+        in_memory_db, date(2025, 7, 1), date(2025, 7, 3), user_name="userA"
+    )
+    assert n_usera == 2
+
 
 def test_get_kpi_data(in_memory_db, populate_jobs):
     start_date = date(2025, 7, 1)
@@ -258,3 +274,56 @@ def test_get_user_resource_usage_summary_monthly_admin(in_memory_db, populate_jo
     assert len(rows) == 1
     assert rows[0]["period"] == "2025-07"
     assert rows[0]["job_count"] == 4
+
+
+def test_get_user_resource_usage_summary_role_admin_case_insensitive(in_memory_db, populate_jobs):
+    """角色 'Admin' 應與 'admin' 相同，可查全叢集。"""
+    rows = get_user_resource_usage_summary(
+        in_memory_db,
+        date(2025, 7, 1),
+        date(2025, 7, 3),
+        viewer_role="Admin",
+        viewer_username="admin_user",
+        subject_user_name=None,
+        time_granularity="daily",
+    )
+    jul1 = next(r for r in rows if r["period"] == "2025-07-01")
+    assert jul1["job_count"] == 2
+
+
+def test_get_user_resource_usage_summary_end_date_inclusive(in_memory_db, populate_jobs):
+    """半開區間應涵蓋 end_date 當日之作業。"""
+    rows = get_user_resource_usage_summary(
+        in_memory_db,
+        date(2025, 7, 3),
+        date(2025, 7, 3),
+        viewer_role="admin",
+        viewer_username="admin_user",
+        subject_user_name="userC",
+        time_granularity="daily",
+    )
+    assert len(rows) == 1
+    assert rows[0]["job_count"] == 1
+
+
+def test_get_user_resource_usage_summary_non_admin_cache_subject_normalized(in_memory_db, populate_jobs):
+    """非 admin 傳不同 subject 時，內層皆正規化為本人，回傳應一致。"""
+    a = get_user_resource_usage_summary(
+        in_memory_db,
+        date(2025, 7, 1),
+        date(2025, 7, 3),
+        viewer_role="user",
+        viewer_username="userA",
+        subject_user_name="userB",
+        time_granularity="daily",
+    )
+    b = get_user_resource_usage_summary(
+        in_memory_db,
+        date(2025, 7, 1),
+        date(2025, 7, 3),
+        viewer_role="user",
+        viewer_username="userA",
+        subject_user_name=None,
+        time_granularity="daily",
+    )
+    assert a == b
