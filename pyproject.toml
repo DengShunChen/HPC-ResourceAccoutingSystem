@@ -1,0 +1,21 @@
+[project]
+name = "hpc-resource-accounting"
+version = "0.1.0"
+description = "運算資源帳務系統（Streamlit、Typer、SQLAlchemy）"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit",
+    "typer",
+    "pandas",
+    "sqlalchemy>=2.0",
+    "redis",
+    "pytest",
+    "alembic",
+    "python-dotenv",
+    "passlib[bcrypt]",
+]
+
+# 應用程式專案（非可安裝套件）；uv sync 只管理環境與 lock，不發佈 wheel。
+[tool.uv]
+package = false

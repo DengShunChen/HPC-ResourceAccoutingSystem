@@ -1,7 +1,8 @@
+# 與 pyproject.toml [project.dependencies] 對齊；pip: pip install -r requirements.txt
 streamlit
 typer
 pandas
-SQLAlchemy
+sqlalchemy>=2.0
 redis
 pytest
 alembic

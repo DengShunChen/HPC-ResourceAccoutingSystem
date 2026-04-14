@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, date
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from database import Base, Job, User, Quota, GroupMapping
-from queries import get_kpi_data, get_usage_over_time, get_filtered_jobs, count_filtered_jobs, get_all_users, get_all_groups, get_all_queues,     get_all_registered_users, get_user_quota, set_user_quota, delete_user, get_all_group_mappings, add_group_mapping, delete_group_mapping,     generate_accounting_report, get_user_resource_usage_summary, get_job_start_date_bounds
+from queries import get_kpi_data, get_usage_over_time, get_filtered_jobs, count_filtered_jobs, get_all_users, get_all_groups, get_all_queues,     get_all_registered_users, get_user_quota, set_user_quota, delete_user, get_all_group_mappings, add_group_mapping, delete_group_mapping,     generate_accounting_report, get_user_resource_usage_summary, get_job_start_date_bounds, invalidate_report_caches, REPORT_CACHE_GEN_REDIS_KEY
 from unittest.mock import patch, MagicMock
 import pandas as pd
 
@@ -22,6 +22,7 @@ def mock_redis_client():
     with patch('queries.redis_client') as mock_redis:
         mock_redis.get.return_value = None  # Simulate cache miss by default
         mock_redis.setex.return_value = True # Simulate successful set
+        mock_redis.incr.return_value = 1
         yield mock_redis
 
 @pytest.fixture
@@ -58,6 +59,11 @@ def populate_jobs(in_memory_db):
     in_memory_db.query(Quota).delete()
     in_memory_db.query(GroupMapping).delete()
     in_memory_db.commit()
+
+def test_invalidate_report_caches_increments_generation(mock_redis_client):
+    invalidate_report_caches()
+    mock_redis_client.incr.assert_called_with(REPORT_CACHE_GEN_REDIS_KEY)
+
 
 def test_get_job_start_date_bounds(in_memory_db, populate_jobs):
     lo, hi = get_job_start_date_bounds(in_memory_db)

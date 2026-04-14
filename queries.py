@@ -1,14 +1,22 @@
 import os
 import redis
 from sqlalchemy.orm import Session
-from sqlalchemy import func, extract, case, Integer, String
+from sqlalchemy import func, extract, case
 from sqlalchemy.sql import expression # Import expression module
 import pandas as pd
 import json
 from functools import wraps
+import time
 from datetime import datetime, timedelta, date
 
 from database import Job, User, Quota, GroupMapping
+from sql_compat import (
+    strftime_column,
+    wait_seconds_between,
+    day_of_week_zero_sunday_str,
+    iso_week_period_label,
+    job_end_time_from_start_and_runtime,
+)
 
 
 def _start_time_bound_to_date(value) -> date:
@@ -41,6 +49,46 @@ redis_client = redis.Redis(
     socket_timeout=3.0,
 )
 
+# 儀表／報表快取世代：invalidate 時 INCR，鍵內含 g{N}，無需 SCAN 刪除舊鍵（舊鍵依 TTL 自然過期）
+REPORT_CACHE_GEN_REDIS_KEY = "report_cache_gen"
+
+# 同一輪（例如 Streamlit rerun）會連續呼叫多個 @cache_results：每次皆 GET 世代鍵會變成 2N 次 Redis。
+# 程式內極短 TTL 快取世代；invalidate 的 INCR 回傳值會立即寫入，同程序內不會用到過期世代。
+_GEN_SNAPSHOT: int | None = None
+_GEN_SNAPSHOT_AT: float = 0.0
+_GEN_LOCAL_TTL_SEC = 0.05
+
+
+def _bump_report_cache_generation_local(gen: int) -> None:
+    global _GEN_SNAPSHOT, _GEN_SNAPSHOT_AT
+    _GEN_SNAPSHOT = int(gen)
+    _GEN_SNAPSHOT_AT = time.monotonic()
+
+
+def _clear_report_cache_generation_local() -> None:
+    global _GEN_SNAPSHOT, _GEN_SNAPSHOT_AT
+    _GEN_SNAPSHOT = None
+    _GEN_SNAPSHOT_AT = 0.0
+
+
+def _report_cache_generation() -> int:
+    global _GEN_SNAPSHOT, _GEN_SNAPSHOT_AT
+    now = time.monotonic()
+    if _GEN_SNAPSHOT is not None and (now - _GEN_SNAPSHOT_AT) < _GEN_LOCAL_TTL_SEC:
+        return _GEN_SNAPSHOT
+    try:
+        v = redis_client.get(REPORT_CACHE_GEN_REDIS_KEY)
+        if v is None or v == "":
+            _bump_report_cache_generation_local(0)
+            return 0
+        g = int(v)
+        _bump_report_cache_generation_local(g)
+        return g
+    except (redis.exceptions.RedisError, ValueError, TypeError):
+        _clear_report_cache_generation_local()
+        return 0
+
+
 # --- Cache Decorator ---
 def json_serializer(obj):
     """Custom JSON serializer for objects not serializable by default json code"""
@@ -66,7 +114,8 @@ def cache_results(ttl_seconds=300):
         @wraps(func)
         def wrapper(*args, **kwargs):
             # 快取鍵不可含 db Session：每次 Streamlit rerun 都是新 Session，str(id) 不同 → 快取永遠 miss
-            key_parts = [func.__name__]
+            # 世代 g{N}：資料載入後 INCR，舊鍵自動失效，無需 KEYS/SCAN
+            key_parts = [func.__name__, f"g{_report_cache_generation()}"]
             for a in args:
                 if _is_sqlalchemy_session(a):
                     continue
@@ -111,48 +160,25 @@ def cache_results(ttl_seconds=300):
     return decorator
 
 
-# 儀表板／詳細統計相關函式之 Redis 鍵前綴（與 cache_results 鍵格式 `funcname:...` 一致）
-_REPORT_CACHE_KEY_PREFIXES = (
-    "get_kpi_data:",
-    "get_usage_over_time:",
-    "get_filtered_jobs:",
-    "get_peak_usage_heatmap:",
-    "get_top_users_by_core_hours:",
-    "get_top_groups_by_core_hours:",
-    "get_top_wallets_by_core_hours:",
-    "get_failure_rate_by_group:",
-    "get_failure_rate_by_user:",
-    "get_job_status_distribution:",
-    "get_average_job_runtime_by_queue:",
-    "get_average_wait_time_by_queue:",
-    "get_wallet_usage_by_resource_type:",
-    "get_usage_by_queue:",
-    "get_all_users:",
-    "get_all_groups:",
-    "get_all_queues:",
-    "get_all_wallets:",
-    "_get_job_start_date_bounds_cached:",
-    "get_job_start_date_bounds:",
-    "get_first_job_date:",
-    "get_last_job_date:",
-    "generate_accounting_report:",
-    "get_user_resource_usage_summary:",  # 舊版快取鍵（TTL 內仍可能存在）
-    "_get_user_resource_usage_summary_cached:",
-)
-
-
 def invalidate_report_caches() -> None:
-    """刪除儀表／報表相關 Redis 快取（jobs 資料變更後呼叫）。"""
-    deleted = 0
+    """使儀表／報表相關 Redis 快取失效：遞增世代鍵（O(1)），鍵格式含 `g{N}` 的舊條目不再命中。
+
+    舊鍵不主動刪除，依各函式 TTL 自然過期，避免 SCAN 大量鍵。
+    若 Streamlit 已載入，一併清除側欄維度 `st.cache_data`，使新使用者／錢包等立即出現在下拉選單。
+    """
     try:
-        for prefix in _REPORT_CACHE_KEY_PREFIXES:
-            for key in redis_client.scan_iter(match=f"{prefix}*", count=500):
-                redis_client.delete(key)
-                deleted += 1
-        if deleted:
-            print(f"Invalidated {deleted} report cache key(s) in Redis.")
+        new_gen = redis_client.incr(REPORT_CACHE_GEN_REDIS_KEY)
+        _bump_report_cache_generation_local(int(new_gen))
+        print(f"Report cache generation set to {new_gen} (keys include g{{n}}; stale keys expire by TTL).")
     except redis.exceptions.RedisError as e:
+        _clear_report_cache_generation_local()
         print(f"Redis cache invalidation skipped: {e}")
+    try:
+        from streamlit_data import clear_dimension_caches
+
+        clear_dimension_caches()
+    except Exception:
+        pass
 
 
 # --- Helper Functions ---
@@ -229,7 +255,7 @@ def get_kpi_data(db: Session, start_date: date, end_date: date, user_name: str =
         func.count(Job.id).label('total_jobs'),
         func.avg(Job.run_time_seconds).label('avg_run_time'),
         func.count(func.distinct(Job.user_name)).label('unique_users'),
-        func.avg((func.julianday(Job.start_time) - func.julianday(Job.queue_time)) * 86400).label('avg_wait_time'),
+        func.avg(wait_seconds_between(db, Job.start_time, Job.queue_time)).label('avg_wait_time'),
         func.sum(case((Job.job_status == 'COMPLETED', 1), else_=0)).label('completed_jobs')
     )
 
@@ -264,12 +290,12 @@ def get_usage_over_time(db: Session, start_date: date, end_date: date, user_name
     """Gets resource usage aggregated by day, month, quarter, or year."""
     if time_granularity == 'daily':
         date_format_str = '%Y-%m-%d'
-        date_label = func.strftime(date_format_str, Job.start_time).label('date')
+        date_label = strftime_column(db, date_format_str, Job.start_time).label('date')
     elif time_granularity == 'monthly':
         date_format_str = '%Y-%m'
-        date_label = func.strftime(date_format_str, Job.start_time).label('date')
+        date_label = strftime_column(db, date_format_str, Job.start_time).label('date')
     elif time_granularity == 'quarterly':
-        year_str = func.strftime('%Y', Job.start_time)
+        year_str = strftime_column(db, '%Y', Job.start_time)
         month_num = extract('month', Job.start_time)
         quarter_num = case(
             (month_num.between(1, 3), expression.literal('Q1')),
@@ -281,10 +307,10 @@ def get_usage_over_time(db: Session, start_date: date, end_date: date, user_name
         date_label = (year_str + expression.literal('-') + quarter_num).label('date')
     elif time_granularity == 'yearly':
         date_format_str = '%Y'
-        date_label = func.strftime(date_format_str, Job.start_time).label('date')
+        date_label = strftime_column(db, date_format_str, Job.start_time).label('date')
     else: # Default to daily
         date_format_str = '%Y-%m-%d'
-        date_label = func.strftime(date_format_str, Job.start_time).label('date')
+        date_label = strftime_column(db, date_format_str, Job.start_time).label('date')
 
     resource_seconds_expr = _get_resource_seconds_expression()
     query = db.query(
@@ -363,16 +389,12 @@ def _get_user_resource_usage_summary_cached(
     """內層：參數已由 get_user_resource_usage_summary 正規化；viewer_role 為小寫 'admin' 或 'user' 等。"""
     tg = (time_granularity or "daily").lower()
     if tg == "monthly":
-        period_label = func.strftime("%Y-%m", Job.start_time).label("period")
+        period_label = strftime_column(db, "%Y-%m", Job.start_time).label("period")
     elif tg == "weekly":
-        # SQLite：%G/%V 為 ISO 8601 週曆年與週次（3.34+）；concat 巢狀以相容舊版 2 參數 concat
-        period_label = func.concat(
-            func.strftime("%G", Job.start_time),
-            func.concat("-W", func.strftime("%V", Job.start_time)),
-        ).label("period")
+        period_label = iso_week_period_label(db, Job.start_time).label("period")
     else:
         tg = "daily"
-        period_label = func.strftime("%Y-%m-%d", Job.start_time).label("period")
+        period_label = strftime_column(db, "%Y-%m-%d", Job.start_time).label("period")
 
     cpu_sec = _get_cpu_node_seconds_expression()
     gpu_sec = _get_gpu_core_seconds_expression()
@@ -821,7 +843,7 @@ def generate_accounting_report(db: Session, month: str = None, year: int = None,
         query = query.filter(extract('year', Job.start_time) == year)
     if month:
         # Assuming month is 'YYYY-MM'
-        query = query.filter(func.strftime('%Y-%m', Job.start_time) == month)
+        query = query.filter(strftime_column(db, "%Y-%m", Job.start_time) == month)
     if user_name:
         query = query.filter(Job.user_name == user_name)
     if wallet_name:
@@ -964,13 +986,14 @@ def get_average_job_runtime_by_queue(db: Session, start_date: date, end_date: da
 @cache_results(ttl_seconds=300)
 def get_average_wait_time_by_queue(db: Session, start_date: date, end_date: date):
     """Gets the average job wait time by queue."""
+    _wait_sec = wait_seconds_between(db, Job.start_time, Job.queue_time)
     query = db.query(
         Job.queue,
-        func.avg((func.julianday(Job.start_time) - func.julianday(Job.queue_time)) * 86400).label('avg_wait_seconds')
+        func.avg(_wait_sec).label('avg_wait_seconds')
     ).filter(
         Job.start_time >= start_date,
         Job.start_time < (end_date + timedelta(days=1))
-    ).group_by(Job.queue).order_by(func.avg((func.julianday(Job.start_time) - func.julianday(Job.queue_time)) * 86400).desc())
+    ).group_by(Job.queue).order_by(func.avg(_wait_sec).desc())
 
     results = query.all()
     return [{'queue': r.queue, 'avg_wait_seconds': r.avg_wait_seconds or 0} for r in results]
@@ -983,7 +1006,7 @@ def get_peak_usage_heatmap(db: Session, start_date: date, end_date: date, user_n
     The WHERE clause uses range queries on indexed start_time for better performance.
     """
     query = db.query(
-        func.strftime('%w', Job.start_time).label('day_of_week'), # Sunday=0, Monday=1, etc.
+        day_of_week_zero_sunday_str(db, Job.start_time).label('day_of_week'),
         extract('hour', Job.start_time).label('hour_of_day'),
         func.count(Job.id).label('job_count')
     ).filter(
@@ -1125,8 +1148,9 @@ def get_active_resources(db: Session):
     """
     now = datetime.utcnow()
 
-    # For SQLite, we need to use the datetime function to add seconds.
-    job_end_time = func.datetime(Job.start_time, '+' + func.cast(Job.run_time_seconds, String) + ' seconds')
+    job_end_time = job_end_time_from_start_and_runtime(
+        db, Job.start_time, Job.run_time_seconds
+    )
 
     # Query for jobs that are currently running (start_time <= now < end_time)
     active_jobs_query = db.query(Job).filter(

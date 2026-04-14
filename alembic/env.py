@@ -2,23 +2,22 @@ from logging.config import fileConfig
 
 import os
 import sys
-from logging.config import fileConfig
 
 # Add the project root directory to the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
 
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
-
 from alembic import context
 
 # Import your Base and engine from your database.py
-from database import Base, engine
+from database import Base, DATABASE_URL, engine
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
+# 與應用程式一致（含 DATABASE_URL 環境變數）；ConfigParser 需轉義 %
+if DATABASE_URL:
+    config.set_main_option("sqlalchemy.url", DATABASE_URL.replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

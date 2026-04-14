@@ -11,40 +11,43 @@ from sqlalchemy import text # Moved to top
 load_dotenv()
 
 # --- Database Connection ---
-# For SQLite, the database is a file. We'll store it in the project root.
-DATABASE_FILE = os.getenv("DATABASE_FILE", "./resource_accounting.db")
-DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
+# 優先使用 DATABASE_URL（例如 postgresql+psycop://...）；未設定時使用 SQLite 檔案 DATABASE_FILE。
+_explicit_url = (os.getenv("DATABASE_URL") or "").strip()
+if _explicit_url:
+    DATABASE_URL = _explicit_url
+    DATABASE_FILE = (os.getenv("DATABASE_FILE") or "").strip()
+else:
+    DATABASE_FILE = os.path.abspath(
+        os.path.expanduser(os.getenv("DATABASE_FILE", "./resource_accounting.db"))
+    )
+    DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
-# SQLite 檔案庫：使用 NullPool 避免不適用的小連線池堆疊；每次請求新連線、用完即關
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={
-        "check_same_thread": False,
-        "timeout": 5.0  # SQLite busy timeout in seconds (helps with concurrent access)
-    },
+_connect_args = {}
+_engine_kwargs = dict(
     pool_pre_ping=True,
     poolclass=NullPool,
-    echo=False  # Set to False in production
+    echo=False,
 )
+if DATABASE_URL.startswith("sqlite"):
+    _connect_args = {
+        "check_same_thread": False,
+        "timeout": 5.0,
+    }
+
+engine = create_engine(DATABASE_URL, connect_args=_connect_args, **_engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Optimize SQLite PRAGMA settings for better performance
-with engine.connect() as connection:
-    # Busy timeout: wait up to 5 seconds for locks (helps with concurrent access)
-    connection.execute(text("PRAGMA busy_timeout = 5000;"))
-    # Cache size: 64MB (negative value means KB)
-    connection.execute(text("PRAGMA cache_size = -65536;"))
-    # Temporary database stored in memory for better performance
-    connection.execute(text("PRAGMA temp_store = MEMORY;"))
-    # Synchronous mode: balance between performance and safety
-    connection.execute(text("PRAGMA synchronous = NORMAL;"))
-    # Locking mode: NORMAL for better concurrency (WAL mode handles concurrency better)
-    connection.execute(text("PRAGMA locking_mode = NORMAL;"))
-    # Journal mode: WAL for better read/write concurrency
-    connection.execute(text("PRAGMA journal_mode = WAL;"))
-    # Foreign keys support
-    connection.execute(text("PRAGMA foreign_keys = ON;"))
-    connection.commit()
+# 僅 SQLite：PRAGMA 調校（PostgreSQL 等方言略過）
+if engine.dialect.name == "sqlite":
+    with engine.connect() as connection:
+        connection.execute(text("PRAGMA busy_timeout = 5000;"))
+        connection.execute(text("PRAGMA cache_size = -65536;"))
+        connection.execute(text("PRAGMA temp_store = MEMORY;"))
+        connection.execute(text("PRAGMA synchronous = NORMAL;"))
+        connection.execute(text("PRAGMA locking_mode = NORMAL;"))
+        connection.execute(text("PRAGMA journal_mode = WAL;"))
+        connection.execute(text("PRAGMA foreign_keys = ON;"))
+        connection.commit()
 Base = declarative_base()
 
 # --- Database Models ---

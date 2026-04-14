@@ -5,17 +5,63 @@ import hashlib
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from database import SessionLocal, Job, ProcessedFile, GroupMapping, User, GroupToGroupMapping, Wallet
-from queries import (
-    get_all_group_to_wallet_mappings,
-    get_all_user_to_wallet_mappings,
-    invalidate_report_caches,
+from database import (
+    SessionLocal,
+    Job,
+    ProcessedFile,
+    GroupMapping,
+    User,
+    GroupToGroupMapping,
+    Wallet,
+    GroupToWalletMapping,
+    UserToWalletMapping,
 )
+from queries import invalidate_report_caches
 from auth import get_password_hash
 
-# 單檔大量寫入時分段 commit，避免單一交易過大與 ORM 物件過多
-_JOB_INSERT_CHUNK = 5000
+# 單檔大量寫入時分段 commit；bulk_insert_mappings 無完整 ORM 實例，可略放大 chunk
+_JOB_INSERT_CHUNK = 10000
 _JOB_ID_YIELD_PER = 8000
+
+
+def _wallet_mapping_dicts(db: Session) -> tuple[dict[str, str], dict[str, str]]:
+    """載入熱路徑直接查 DB，避免經過 Redis 包裝的 queries 快取函式。"""
+    group_rows = (
+        db.query(GroupToWalletMapping.source_group, Wallet.name)
+        .join(Wallet, GroupToWalletMapping.wallet_id == Wallet.id)
+        .all()
+    )
+    group_to_wallet = {sg: name for sg, name in group_rows}
+    user_rows = (
+        db.query(User.username, Wallet.name)
+        .join(UserToWalletMapping, User.id == UserToWalletMapping.user_id)
+        .join(Wallet, Wallet.id == UserToWalletMapping.wallet_id)
+        .all()
+    )
+    user_to_wallet = {un: wn for un, wn in user_rows}
+    return group_to_wallet, user_to_wallet
+
+
+def _compose_datetime(
+    df: pd.DataFrame,
+    year_col: str,
+    month_col: str,
+    day_col: str,
+    hour_col: str,
+    minute_col: str,
+    second_col: str,
+) -> pd.Series:
+    """以欄位組裝 timestamp，避免 `agg('-'.join, axis=1)` 在大表上極慢。"""
+    y = pd.to_numeric(df[year_col], errors="coerce")
+    mo = pd.to_numeric(df[month_col], errors="coerce")
+    d = pd.to_numeric(df[day_col], errors="coerce")
+    h = pd.to_numeric(df[hour_col], errors="coerce")
+    mi = pd.to_numeric(df[minute_col], errors="coerce")
+    s = pd.to_numeric(df[second_col], errors="coerce")
+    return pd.to_datetime(
+        {"year": y, "month": mo, "day": d, "hour": h, "minute": mi, "second": s},
+        errors="coerce",
+    )
 
 
 def _analyze_jobs_table(db: Session) -> None:
@@ -87,14 +133,26 @@ def transform_data(df: pd.DataFrame, db: Session) -> pd.DataFrame:
     # Handle Memory - assuming it's a number, remove any non-numeric characters just in case
     df['Memory'] = pd.to_numeric(df['Memory'].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').fillna(0)
 
-    # --- 2. Create DateTime Columns ---
-    df['queue_time'] = pd.to_datetime(df[['QueDateYear', 'QueDateMonth', 'QueDateDay', 
-                                         'QueDateHour', 'QueDateMinute', 'QueDateSecond']].astype(str).agg('-'.join, axis=1),
-                                         format='%Y-%m-%d-%H-%M-%S', errors='coerce')
-    df['start_time'] = pd.to_datetime(df[['StartDateYear', 'StartDateMonth', 'StartDateDay', 
-                                         'StartDateHour', 'StartDateMinute', 'StartDateSecond']].astype(str).agg('-'.join, axis=1),
-                                         format='%Y-%m-%d-%H-%M-%S', errors='coerce')
-    df.dropna(subset=['queue_time', 'start_time'], inplace=True)
+    # --- 2. Create DateTime Columns（向量化；避免逐列字串拼接）---
+    df["queue_time"] = _compose_datetime(
+        df,
+        "QueDateYear",
+        "QueDateMonth",
+        "QueDateDay",
+        "QueDateHour",
+        "QueDateMinute",
+        "QueDateSecond",
+    )
+    df["start_time"] = _compose_datetime(
+        df,
+        "StartDateYear",
+        "StartDateMonth",
+        "StartDateDay",
+        "StartDateHour",
+        "StartDateMinute",
+        "StartDateSecond",
+    )
+    df.dropna(subset=["queue_time", "start_time"], inplace=True)
 
     # --- 3. Apply Mappings and Business Logic ---
     qlower = df["Queue"].astype(str).str.lower()
@@ -115,8 +173,7 @@ def transform_data(df: pd.DataFrame, db: Session) -> pd.DataFrame:
         df["UserName"] = df["UserGroup"].map(group_to_username).fillna(df["UserName"])
 
     df["wallet_name"] = df["UserGroup"]
-    group_to_wallet_dict = {m["source_group"]: m["wallet_name"] for m in get_all_group_to_wallet_mappings(db)}
-    user_to_wallet_dict = {m["username"]: m["wallet_name"] for m in get_all_user_to_wallet_mappings(db)}
+    group_to_wallet_dict, user_to_wallet_dict = _wallet_mapping_dicts(db)
     if group_to_wallet_dict:
         df["wallet_name"] = df["UserGroup"].map(group_to_wallet_dict).fillna(df["wallet_name"])
     if user_to_wallet_dict:
@@ -198,7 +255,9 @@ def load_new_data(db: Session = None, specific_file: str = None, force: bool = F
     try:
         files_to_process = []
         modified_files = []
-        
+        # 掃描目錄時已讀過檔案的 checksum 時，寫入階段不重複整檔 SHA256
+        checksum_precomputed: dict[str, str] = {}
+
         if specific_file:
             if os.path.exists(os.path.join(log_dir, specific_file)):
                 files_to_process.append(specific_file)
@@ -219,6 +278,7 @@ def load_new_data(db: Session = None, specific_file: str = None, force: bool = F
                     print(f"Found new file: {filename}")
                 else:
                     current_checksum = calculate_checksum(file_path)
+                    checksum_precomputed[filename] = current_checksum
                     if processed_files_db[filename] != current_checksum:
                         files_to_process.append(filename)
                         modified_files.append(filename)
@@ -242,7 +302,14 @@ def load_new_data(db: Session = None, specific_file: str = None, force: bool = F
                 print("Existing data for jobs deleted.")
 
             try:
-                raw_df = pd.read_csv(file_path, sep='\\s+', header=None, names=column_names, on_bad_lines='skip', engine='python')
+                raw_df = pd.read_csv(
+                    file_path,
+                    sep=r"\s+",
+                    header=None,
+                    names=column_names,
+                    on_bad_lines="skip",
+                    engine="c",
+                )
                 raw_df['source_file'] = filename
                 
                 clean_df = transform_data(raw_df, db)
@@ -264,35 +331,23 @@ def load_new_data(db: Session = None, specific_file: str = None, force: bool = F
                         _bulk_ensure_wallets_users(db, jobs_to_add_df)
 
                         records = jobs_to_add_df.to_dict("records")
-                        jobs_to_add = [
-                            Job(
-                                job_id=r["job_id"],
-                                job_name=r["job_name"],
-                                user_name=r["user_name"],
-                                user_group=r["user_group"],
-                                queue=r["queue"],
-                                job_status=r["job_status"],
-                                nodes=r["nodes"],
-                                cores=r["cores"],
-                                memory=r["memory"],
-                                run_time_seconds=r["run_time_seconds"],
-                                queue_time=r["queue_time"],
-                                start_time=r["start_time"],
-                                elapse_limit_seconds=r["elapse_limit_seconds"],
-                                resource_type=r["resource_type"],
-                                wallet_name=r["wallet_name"],
-                                source_file=r["source_file"],
-                            )
-                            for r in records
-                        ]
-                        for i in range(0, len(jobs_to_add), _JOB_INSERT_CHUNK):
-                            db.add_all(jobs_to_add[i : i + _JOB_INSERT_CHUNK])
+                        for r in records:
+                            m = r.get("memory")
+                            r["memory"] = "" if m is None or pd.isna(m) else str(m)
+                            wn = r.get("wallet_name")
+                            if wn is not None and pd.isna(wn):
+                                r["wallet_name"] = None
+                        n_ins = len(records)
+                        for i in range(0, n_ins, _JOB_INSERT_CHUNK):
+                            db.bulk_insert_mappings(Job, records[i : i + _JOB_INSERT_CHUNK])
                             db.commit()
-                        print(f"Successfully loaded {len(jobs_to_add)} new jobs from {filename}.")
+                        print(f"Successfully loaded {n_ins} new jobs from {filename}.")
                         _analyze_jobs_table(db)
 
                 # Update or create ProcessedFile entry
-                current_checksum = calculate_checksum(file_path)
+                current_checksum = checksum_precomputed.get(filename) or calculate_checksum(
+                    file_path
+                )
                 processed_file_entry = db.query(ProcessedFile).filter(ProcessedFile.filename == filename).first()
                 if processed_file_entry:
                     processed_file_entry.checksum = current_checksum

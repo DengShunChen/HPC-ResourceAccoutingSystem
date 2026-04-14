@@ -51,10 +51,34 @@
     # 編輯 .env 檔案，例如設定 DATABASE_FILE, REDIS_HOST, REDIS_PORT
     ```
 
-4.  **安裝相依套件**:
+4.  **安裝相依套件**（擇一）:
+
+    **pip（傳統）**
 
     ```bash
     pip install -r requirements.txt
+    ```
+
+    **uv（建議，較快、可鎖版本）**
+
+    需先安裝 [uv](https://docs.astral.sh/uv/getting-started/installation/)，在專案根目錄執行：
+
+    ```bash
+    uv sync
+    ```
+
+    會建立 `.venv` 並依 `pyproject.toml` 安裝套件。之後可用：
+
+    ```bash
+    uv run pytest
+    uv run streamlit run 系統登入.py
+    uv run python cli.py --help
+    ```
+
+    若要產生可重現的鎖檔（建議在可連 PyPI 的環境執行後納入版控）：
+
+    ```bash
+    uv lock
     ```
 
 5.  **初始化/升級資料庫**:

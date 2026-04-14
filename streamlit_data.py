@@ -29,3 +29,25 @@ def streamlit_all_queues() -> list:
 def streamlit_all_wallets() -> list:
     with db_session_scope() as db:
         return get_all_wallets(db)
+
+
+def clear_dimension_caches() -> None:
+    """使側欄維度清單快取失效（於 jobs 載入／Redis 報表快取失效後呼叫）。
+
+    僅在 Streamlit 應用執行中才 clear；CLI、pytest、背景載入等無 runtime 時直接略過。
+    """
+    try:
+        if not (hasattr(st, "runtime") and st.runtime.exists()):
+            return
+    except Exception:
+        return
+    for fn in (
+        streamlit_all_users,
+        streamlit_all_groups,
+        streamlit_all_queues,
+        streamlit_all_wallets,
+    ):
+        try:
+            fn.clear()
+        except Exception:
+            pass
