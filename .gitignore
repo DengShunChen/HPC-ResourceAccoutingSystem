@@ -55,6 +55,7 @@ data/
 # Log files
 cron.log
 nohup.out
+load-data.log
 
 # IDE / Editor specific
 .idea/

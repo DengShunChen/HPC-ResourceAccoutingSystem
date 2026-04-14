@@ -28,16 +28,16 @@ def mock_redis_client():
 def populate_jobs(in_memory_db):
     jobs_data = [
         Job(job_id="job1", job_name="test_job_1", user_name="userA", user_group="groupX", queue="cpu_queue",
-            job_status="COMPLETED", nodes=1, cores=10, memory="10G", run_time_str="100s", run_time_seconds=100,
+            job_status="COMPLETED", nodes=1, cores=10, memory="10G", run_time_seconds=100,
             queue_time=datetime(2025, 7, 1, 10, 0, 0), start_time=datetime(2025, 7, 1, 10, 1, 0), elapse_limit_seconds=3600, resource_type="CPU"),
         Job(job_id="job2", job_name="test_job_2", user_name="userB", user_group="groupY", queue="gpu_queue",
-            job_status="COMPLETED", nodes=1, cores=20, memory="20G", run_time_str="200s", run_time_seconds=200,
+            job_status="COMPLETED", nodes=1, cores=20, memory="20G", run_time_seconds=200,
             queue_time=datetime(2025, 7, 1, 11, 0, 0), start_time=datetime(2025, 7, 1, 11, 2, 0), elapse_limit_seconds=7200, resource_type="GPU"),
         Job(job_id="job3", job_name="test_job_3", user_name="userA", user_group="groupX", queue="cpu_queue",
-            job_status="RUNNING", nodes=2, cores=5, memory="5G", run_time_str="50s", run_time_seconds=50,
+            job_status="RUNNING", nodes=2, cores=5, memory="5G", run_time_seconds=50,
             queue_time=datetime(2025, 7, 2, 9, 0, 0), start_time=datetime(2025, 7, 2, 9, 1, 0), elapse_limit_seconds=1800, resource_type="CPU"),
         Job(job_id="job4", job_name="test_job_4", user_name="userC", user_group="groupZ", queue="cpu_queue",
-            job_status="COMPLETED", nodes=1, cores=15, memory="15G", run_time_str="150s", run_time_seconds=150,
+            job_status="COMPLETED", nodes=1, cores=15, memory="15G", run_time_seconds=150,
             queue_time=datetime(2025, 7, 3, 14, 0, 0), start_time=datetime(2025, 7, 3, 14, 5, 0), elapse_limit_seconds=5400, resource_type="CPU"),
     ]
     in_memory_db.add_all(jobs_data)
@@ -82,6 +82,27 @@ def test_get_filtered_jobs(in_memory_db, populate_jobs):
 
     jobs_filtered = get_filtered_jobs(in_memory_db, user_name="userA")
     assert jobs_filtered['total_items'] == 2
+
+    jobs_no_total = get_filtered_jobs(in_memory_db, page=1, page_size=2, include_total=False)
+    assert jobs_no_total["total_items"] is None
+    assert len(jobs_no_total["jobs"]) == 2
+
+
+def test_get_filtered_jobs_cursor_pagination(in_memory_db, populate_jobs):
+    """cursor 分頁：依主鍵 id 遞增；last_id=0 表示從頭開始（id>0）。"""
+    p1 = get_filtered_jobs(in_memory_db, page_size=2, last_id=0)
+    assert p1["total_items"] is None
+    assert len(p1["jobs"]) == 2
+    assert p1["jobs"][0]["id"] < p1["jobs"][1]["id"]
+
+    p2 = get_filtered_jobs(in_memory_db, page_size=2, last_id=p1["jobs"][-1]["id"])
+    assert p2["total_items"] is None
+    assert len(p2["jobs"]) == 2
+    assert all(j["id"] > p1["jobs"][-1]["id"] for j in p2["jobs"])
+
+    p3 = get_filtered_jobs(in_memory_db, page_size=2, last_id=p2["jobs"][-1]["id"])
+    assert p3["total_items"] is None
+    assert len(p3["jobs"]) == 0
 
 def test_get_all_users_groups_queues(in_memory_db, populate_jobs):
     users = get_all_users(in_memory_db)

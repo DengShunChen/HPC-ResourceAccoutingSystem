@@ -10,12 +10,36 @@ from datetime import datetime, timedelta, date
 
 from database import Job, User, Quota, GroupMapping
 
+
+def _start_time_bound_to_date(value) -> date:
+    """將 min/max(start_time) 或 Redis 快取還原的 ISO 字串統一為 date（供側欄預設日期）。"""
+    if value is None:
+        return date.today()
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return date.today()
+        return date.fromisoformat(s[:10])
+    return date.today()
+
+
 # --- Redis Cache Connection ---
 # In a real app, Redis connection details would also come from env vars
 # For simplicity, we'll use default localhost for now
 redis_host = os.getenv("REDIS_HOST", "localhost")
 redis_port = int(os.getenv("REDIS_PORT", 6379))
-redis_client = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True)
+redis_client = redis.Redis(
+    host=redis_host,
+    port=redis_port,
+    db=0,
+    decode_responses=True,
+    socket_connect_timeout=1.5,
+    socket_timeout=3.0,
+)
 
 # --- Cache Decorator ---
 def json_serializer(obj):
@@ -24,15 +48,33 @@ def json_serializer(obj):
         return obj.isoformat()
     raise TypeError(f"Type {type(obj)} not serializable")
 
+def _is_sqlalchemy_session(obj) -> bool:
+    try:
+        return isinstance(obj, Session)
+    except Exception:
+        return False
+
+
+def _cache_key_part(value):
+    if isinstance(value, (datetime, date)):
+        return str(value)
+    return str(value)
+
+
 def cache_results(ttl_seconds=300):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            # Create a cache key based on function name and arguments
-            processed_args = [str(a) if isinstance(a, (datetime, date)) else a for a in args]
-            processed_kwargs = {k: (str(v) if isinstance(v, (datetime, date)) else v) for k, v in kwargs.items()}
-
-            key_parts = [func.__name__] + [str(a) for a in processed_args] + [f"{k}={v}" for k, v in sorted(processed_kwargs.items())]
+            # 快取鍵不可含 db Session：每次 Streamlit rerun 都是新 Session，str(id) 不同 → 快取永遠 miss
+            key_parts = [func.__name__]
+            for a in args:
+                if _is_sqlalchemy_session(a):
+                    continue
+                key_parts.append(_cache_key_part(a))
+            for k, v in sorted(kwargs.items()):
+                if k == "db" and _is_sqlalchemy_session(v):
+                    continue
+                key_parts.append(f"{k}={_cache_key_part(v)}")
             cache_key = ":".join(key_parts)
 
             try:
@@ -40,12 +82,13 @@ def cache_results(ttl_seconds=300):
                 if cached_data:
                     # print(f"Cache HIT for key: {cache_key}")
                     loaded_data = json.loads(cached_data)
-                    # Check if the result is a string that looks like a date and convert it back
+                    # 單一 date/datetime 快取成 JSON 字串；含時間的 ISO 須取前 10 碼成 date
                     if isinstance(loaded_data, str):
                         try:
-                            return date.fromisoformat(loaded_data)
+                            if len(loaded_data) >= 10 and loaded_data[4] == "-" and loaded_data[7] == "-":
+                                return date.fromisoformat(loaded_data[:10])
                         except (ValueError, TypeError):
-                            pass # Not a date string, return as is
+                            pass
                     return loaded_data
             except redis.exceptions.RedisError as e:
                 print(f"Redis error on GET: {e}")
@@ -67,6 +110,47 @@ def cache_results(ttl_seconds=300):
         return wrapper
     return decorator
 
+
+# 儀表板／詳細統計相關函式之 Redis 鍵前綴（與 cache_results 鍵格式 `funcname:...` 一致）
+_REPORT_CACHE_KEY_PREFIXES = (
+    "get_kpi_data:",
+    "get_usage_over_time:",
+    "get_filtered_jobs:",
+    "get_peak_usage_heatmap:",
+    "get_top_users_by_core_hours:",
+    "get_top_groups_by_core_hours:",
+    "get_top_wallets_by_core_hours:",
+    "get_failure_rate_by_group:",
+    "get_failure_rate_by_user:",
+    "get_job_status_distribution:",
+    "get_average_job_runtime_by_queue:",
+    "get_average_wait_time_by_queue:",
+    "get_wallet_usage_by_resource_type:",
+    "get_usage_by_queue:",
+    "get_all_users:",
+    "get_all_groups:",
+    "get_all_queues:",
+    "get_all_wallets:",
+    "get_first_job_date:",
+    "get_last_job_date:",
+    "generate_accounting_report:",
+)
+
+
+def invalidate_report_caches() -> None:
+    """刪除儀表／報表相關 Redis 快取（jobs 資料變更後呼叫）。"""
+    deleted = 0
+    try:
+        for prefix in _REPORT_CACHE_KEY_PREFIXES:
+            for key in redis_client.scan_iter(match=f"{prefix}*", count=500):
+                redis_client.delete(key)
+                deleted += 1
+        if deleted:
+            print(f"Invalidated {deleted} report cache key(s) in Redis.")
+    except redis.exceptions.RedisError as e:
+        print(f"Redis cache invalidation skipped: {e}")
+
+
 # --- Helper Functions ---
 def _get_resource_seconds_expression():
     """
@@ -81,10 +165,17 @@ def _get_resource_seconds_expression():
 
 # --- Query Functions ---
 
-@cache_results(ttl_seconds=60)
+@cache_results(ttl_seconds=120)
 def get_kpi_data(db: Session, start_date: date, end_date: date, user_name: str = None, user_group: str = None, queue: str = None, wallet_name: str = None):
-    """Calculates key performance indicators (KPIs)."""
-    base_query = db.query(Job).filter(Job.start_time >= start_date, Job.start_time <= (end_date + timedelta(days=1)))
+    """Calculates key performance indicators (KPIs).
+    
+    Optimized to use range queries on indexed start_time column.
+    """
+    # 半開區間 [start_date, end_date+1) 涵蓋 end_date 整日
+    base_query = db.query(Job).filter(
+        Job.start_time >= start_date,
+        Job.start_time < (end_date + timedelta(days=1))
+    )
 
     # Apply filters
     if user_name and user_name != "(全部)":
@@ -144,7 +235,7 @@ def get_kpi_data(db: Session, start_date: date, end_date: date, user_name: str =
 
     return kpis
 
-@cache_results(ttl_seconds=300)
+@cache_results(ttl_seconds=600)
 def get_usage_over_time(db: Session, start_date: date, end_date: date, user_name: str = None, user_group: str = None, queue: str = None, wallet_name: str = None, time_granularity: str = 'daily'):
     """Gets resource usage aggregated by day, month, quarter, or year."""
     if time_granularity == 'daily':
@@ -179,7 +270,7 @@ def get_usage_over_time(db: Session, start_date: date, end_date: date, user_name
     ).group_by(date_label, Job.resource_type).order_by(date_label)
 
     # Apply filters
-    query = query.filter(Job.start_time >= start_date, Job.start_time <= (end_date + timedelta(days=1)))
+    query = query.filter(Job.start_time >= start_date, Job.start_time < (end_date + timedelta(days=1)))
     if user_name and user_name != "(全部)":
         query = query.filter(Job.user_name == user_name)
     if user_group and user_group != "(全部)":
@@ -200,15 +291,22 @@ def get_usage_over_time(db: Session, start_date: date, end_date: date, user_name
 def get_filtered_jobs(db: Session, page: int = 1, page_size: int = 20,
                       start_date: date = None, end_date: date = None,
                       user_name: str = None, user_group: str = None,
-                      queue: str = None, resource_type: str = None, wallet_name: str = None):
-    """Gets a paginated list of jobs with filters."""
+                      queue: str = None, resource_type: str = None, wallet_name: str = None,
+                      last_id: int = None, include_total: bool = True):
+    """Gets a paginated list of jobs with filters.
+    
+    Args:
+        last_id: Cursor 分頁時傳上一頁最後一筆的 id；依主鍵遞增續撈。傳 0 表示從頭（id>0）。
+                 若為 None 則使用 OFFSET 分頁（排序為 start_time desc, id desc）。
+        include_total: 若為 False，不執行 COUNT（儀表板僅顯示列表時可省一次全表掃描）。
+    """
     query = db.query(Job)
 
     # Apply filters
     if start_date:
         query = query.filter(Job.start_time >= start_date)
     if end_date:
-        query = query.filter(Job.start_time <= (end_date + timedelta(days=1)))
+        query = query.filter(Job.start_time < (end_date + timedelta(days=1)))
     if user_name and user_name != "(全部)":
         query = query.filter(Job.user_name == user_name)
     if user_group and user_group != "(全部)":
@@ -220,8 +318,17 @@ def get_filtered_jobs(db: Session, page: int = 1, page_size: int = 20,
     if wallet_name and wallet_name != "(全部)":
         query = query.filter(Job.wallet_name == wallet_name)
 
-    total_items = query.count()
-    jobs = query.offset((page - 1) * page_size).limit(page_size).all()
+    if last_id is not None:
+        query = query.filter(Job.id > last_id).order_by(Job.id)
+        jobs = query.limit(page_size).all()
+        total_items = None
+    else:
+        query = query.order_by(Job.start_time.desc(), Job.id.desc())
+        if include_total:
+            total_items = query.count()
+        else:
+            total_items = None
+        jobs = query.offset((page - 1) * page_size).limit(page_size).all()
 
     # Convert Job objects to dictionaries for JSON serialization
     jobs_data = []
@@ -563,7 +670,7 @@ def get_top_users_by_core_hours(db: Session, start_date: date, end_date: date, u
         func.sum(resource_seconds_expr).label('total_resource_seconds')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1))
     )
     if user_group and user_group != "(全部)":
         query = query.filter(Job.user_group == user_group)
@@ -585,7 +692,7 @@ def get_top_groups_by_core_hours(db: Session, start_date: date, end_date: date, 
         func.sum(resource_seconds_expr).label('total_resource_seconds')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1))
     )
     if user_name and user_name != "(全部)":
         query = query.filter(Job.user_name == user_name)
@@ -607,7 +714,7 @@ def get_top_wallets_by_core_hours(db: Session, start_date: date, end_date: date,
         func.sum(resource_seconds_expr).label('total_resource_seconds')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1))
     ).group_by(Job.wallet_name).order_by(func.sum(resource_seconds_expr).desc()).limit(limit)
 
     results = query.all()
@@ -621,7 +728,7 @@ def get_job_status_distribution(db: Session, start_date: date, end_date: date, u
         func.count(Job.id).label('job_count')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1))
     )
 
     if user_name and user_name != "(全部)":
@@ -647,7 +754,7 @@ def get_usage_by_queue(db: Session, start_date: date, end_date: date, user_name:
         func.sum(resource_seconds_expr).label('total_resource_seconds')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1))
     )
 
     if user_name and user_name != "(全部)":
@@ -670,7 +777,7 @@ def get_average_job_runtime_by_queue(db: Session, start_date: date, end_date: da
         func.avg(Job.run_time_seconds).label('avg_runtime_seconds')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1))
     )
 
     if user_name and user_name != "(全部)":
@@ -693,22 +800,26 @@ def get_average_wait_time_by_queue(db: Session, start_date: date, end_date: date
         func.avg((func.julianday(Job.start_time) - func.julianday(Job.queue_time)) * 86400).label('avg_wait_seconds')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1))
     ).group_by(Job.queue).order_by(func.avg((func.julianday(Job.start_time) - func.julianday(Job.queue_time)) * 86400).desc())
 
     results = query.all()
     return [{'queue': r.queue, 'avg_wait_seconds': r.avg_wait_seconds or 0} for r in results]
 
-@cache_results(ttl_seconds=300)
+@cache_results(ttl_seconds=600)
 def get_peak_usage_heatmap(db: Session, start_date: date, end_date: date, user_name: str = None, user_group: str = None, queue: str = None, wallet_name: str = None):
-    """Gets data for peak usage heatmap (hour vs. day of week)."""
+    """Gets data for peak usage heatmap (hour vs. day of week).
+    
+    Note: Uses extract() for date parts which is necessary for grouping.
+    The WHERE clause uses range queries on indexed start_time for better performance.
+    """
     query = db.query(
         func.strftime('%w', Job.start_time).label('day_of_week'), # Sunday=0, Monday=1, etc.
         extract('hour', Job.start_time).label('hour_of_day'),
         func.count(Job.id).label('job_count')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1))  # Use < instead of <= for consistency
     )
 
     if user_name and user_name != "(全部)":
@@ -729,13 +840,17 @@ def get_peak_usage_heatmap(db: Session, start_date: date, end_date: date, user_n
 def get_first_job_date(db: Session) -> date:
     """Gets the earliest job start date from the database."""
     first_job_date = db.query(func.min(Job.start_time)).scalar()
-    return first_job_date if first_job_date else date.today()
+    if not first_job_date:
+        return date.today()
+    return _start_time_bound_to_date(first_job_date)
 
 @cache_results(ttl_seconds=3600) # Cache for an hour
 def get_last_job_date(db: Session) -> date:
     """Gets the latest job start date from the database."""
     last_job_date = db.query(func.max(Job.start_time)).scalar()
-    return last_job_date if last_job_date else date.today()
+    if not last_job_date:
+        return date.today()
+    return _start_time_bound_to_date(last_job_date)
 
 @cache_results(ttl_seconds=300)
 def get_failure_rate_by_group(db: Session, start_date: date, end_date: date, limit: int = 10):
@@ -747,7 +862,7 @@ def get_failure_rate_by_group(db: Session, start_date: date, end_date: date, lim
         func.sum(case((Job.job_status.in_(failed_statuses), 1), else_=0)).label('failed_jobs')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1))
     ).group_by(Job.user_group)
 
     results = query.all()
@@ -772,7 +887,7 @@ def get_failure_rate_by_user(db: Session, start_date: date, end_date: date, limi
         func.sum(case((Job.job_status.in_(failed_statuses), 1), else_=0)).label('failed_jobs')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1))
     ).group_by(Job.user_name)
 
     results = query.all()
@@ -800,7 +915,7 @@ def get_wallet_usage_by_resource_type(db: Session, start_date: date, end_date: d
         sum_expr.label('total_resource_seconds')
     ).filter(
         Job.start_time >= start_date,
-        Job.start_time <= (end_date + timedelta(days=1)),
+        Job.start_time < (end_date + timedelta(days=1)),
         Job.resource_type == resource_type
     )
 

@@ -3,16 +3,51 @@ import pandas as pd
 import configparser
 import hashlib
 from sqlalchemy.orm import Session
-from datetime import datetime
 
-from database import SessionLocal, Job, ProcessedFile, GroupMapping, User, GroupToGroupMapping, Wallet, GroupToWalletMapping, UserToWalletMapping
-from queries import get_all_group_to_wallet_mappings, get_all_user_to_wallet_mappings
-from auth import create_user, get_user
+from database import SessionLocal, Job, ProcessedFile, GroupMapping, User, GroupToGroupMapping, Wallet
+from queries import (
+    get_all_group_to_wallet_mappings,
+    get_all_user_to_wallet_mappings,
+    invalidate_report_caches,
+)
+from auth import get_password_hash
+
+# 單檔大量寫入時分段 commit，避免單一交易過大與 ORM 物件過多
+_JOB_INSERT_CHUNK = 5000
 
 def get_config():
     config = configparser.ConfigParser()
     config.read('config.ini')
     return config
+
+def _bulk_ensure_wallets_users(db: Session, jobs_df: pd.DataFrame) -> None:
+    """預先批次建立本批 jobs 需要的 Wallet / User，避免逐列查詢與 commit。"""
+    wallet_names = [w for w in jobs_df["wallet_name"].dropna().unique().tolist() if w != ""]
+    if wallet_names:
+        have = {w.name for w in db.query(Wallet).filter(Wallet.name.in_(wallet_names)).all()}
+        new_w = [Wallet(name=n) for n in wallet_names if n not in have]
+        if new_w:
+            db.add_all(new_w)
+            db.commit()
+            for w in new_w:
+                print(f"Created new wallet: {w.name}")
+
+    usernames = [u for u in jobs_df["user_name"].dropna().unique().tolist() if u != ""]
+    if usernames:
+        have_u = {u.username for u in db.query(User).filter(User.username.in_(usernames)).all()}
+        missing = [u for u in usernames if u not in have_u]
+        for name in missing:
+            db.add(
+                User(
+                    username=name,
+                    hashed_password=get_password_hash("default_password_123"),
+                    role="user",
+                )
+            )
+            print(f"Automatically creating user: {name}")
+        if missing:
+            db.commit()
+
 
 def calculate_checksum(file_path):
     """Calculates the SHA256 checksum of a file."""
@@ -48,25 +83,47 @@ def transform_data(df: pd.DataFrame, db: Session) -> pd.DataFrame:
     df.dropna(subset=['queue_time', 'start_time'], inplace=True)
 
     # --- 3. Apply Mappings and Business Logic ---
-    df['resource_type'] = df['Queue'].apply(lambda x: 'GPU' if 'gpu' in str(x).lower() else 'CPU')
+    qlower = df["Queue"].astype(str).str.lower()
+    df["resource_type"] = qlower.str.contains("gpu", na=False).map({True: "GPU", False: "CPU"})
 
-    # Apply group-to-group mappings first
     group_to_group_mappings = {m.source_group: m.target_group for m in db.query(GroupToGroupMapping).all()}
-    df['UserGroup'] = df['UserGroup'].apply(lambda x: group_to_group_mappings.get(x, x))
+    if group_to_group_mappings:
+        df["UserGroup"] = df["UserGroup"].replace(group_to_group_mappings)
 
-    # Set wallet name based on mappings (user mapping takes precedence)
-    df['wallet_name'] = df['UserGroup'] # Default to user group
-    group_to_wallet_dict = {m['source_group']: m['wallet_name'] for m in get_all_group_to_wallet_mappings(db)}
-    df['wallet_name'] = df.apply(lambda row: group_to_wallet_dict.get(row['UserGroup'], row['wallet_name']), axis=1)
-    user_to_wallet_dict = {m['username']: m['wallet_name'] for m in get_all_user_to_wallet_mappings(db)}
-    df['wallet_name'] = df.apply(lambda row: user_to_wallet_dict.get(row['UserName'], row['wallet_name']), axis=1)
+    # GroupMapping：一次 join 查回，避免 N+1
+    group_to_username = {
+        row[0]: row[1]
+        for row in db.query(GroupMapping.source_group, User.username)
+        .join(User, GroupMapping.target_user_id == User.id)
+        .all()
+    }
+    if group_to_username:
+        df["UserName"] = df["UserGroup"].map(group_to_username).fillna(df["UserName"])
 
-    # Auto-create users if they don't exist
-    unique_users = df['UserName'].unique()
-    for username in unique_users:
-        if not get_user(db, username):
-            print(f"Automatically creating user: {username}")
-            create_user(db, username, "default_password_123", role="user")
+    df["wallet_name"] = df["UserGroup"]
+    group_to_wallet_dict = {m["source_group"]: m["wallet_name"] for m in get_all_group_to_wallet_mappings(db)}
+    user_to_wallet_dict = {m["username"]: m["wallet_name"] for m in get_all_user_to_wallet_mappings(db)}
+    if group_to_wallet_dict:
+        df["wallet_name"] = df["UserGroup"].map(group_to_wallet_dict).fillna(df["wallet_name"])
+    if user_to_wallet_dict:
+        df["wallet_name"] = df["UserName"].map(user_to_wallet_dict).fillna(df["wallet_name"])
+
+    # 自動建帳：一次查已存在者，其餘批次 insert + 單次 commit
+    unique_users = [u for u in df["UserName"].dropna().unique() if u != ""]
+    if unique_users:
+        have = {u.username for u in db.query(User).filter(User.username.in_(unique_users)).all()}
+        missing = [u for u in unique_users if u not in have]
+        for name in missing:
+            db.add(
+                User(
+                    username=name,
+                    hashed_password=get_password_hash("default_password_123"),
+                    role="user",
+                )
+            )
+            print(f"Automatically creating user: {name}")
+        if missing:
+            db.commit()
 
     # Map job status
     status_map = {'EXT': 'COMPLETED', 'CCL': 'USER_CANCELED'}
@@ -188,42 +245,33 @@ def load_new_data(db: Session = None, specific_file: str = None, force: bool = F
                     if jobs_to_add_df.empty:
                         print(f"No new unique jobs to add from {filename}.")
                     else:
-                        jobs_to_add = []
-                        for index, row in jobs_to_add_df.iterrows():
-                            wallet = db.query(Wallet).filter(Wallet.name == row['wallet_name']).first()
-                            if not wallet:
-                                wallet = Wallet(name=row['wallet_name'])
-                                db.add(wallet)
-                                db.commit()
-                                db.refresh(wallet)
-                                print(f"Created new wallet: {row['wallet_name']}")
+                        _bulk_ensure_wallets_users(db, jobs_to_add_df)
 
-                            user = db.query(User).filter(User.username == row['user_name']).first()
-                            if not user:
-                                print(f"Warning: User {row['user_name']} not found, creating with default password.")
-                                create_user(db, row['user_name'], "default_password_123", role="user")
-                                user = db.query(User).filter(User.username == row['user_name']).first()
-
-                            jobs_to_add.append(Job(
-                                job_id=row['job_id'],
-                                job_name=row['job_name'],
-                                user_name=row['user_name'],
-                                user_group=row['user_group'],
-                                queue=row['queue'],
-                                job_status=row['job_status'],
-                                nodes=row['nodes'],
-                                cores=row['cores'],
-                                memory=row['memory'],
-                                run_time_seconds=row['run_time_seconds'],
-                                queue_time=row['queue_time'],
-                                start_time=row['start_time'],
-                                elapse_limit_seconds=row['elapse_limit_seconds'],
-                                resource_type=row['resource_type'],
-                                wallet_name=row['wallet_name'],
-                                source_file=row['source_file']
-                            ))
-                        db.add_all(jobs_to_add)
-                        db.commit()
+                        records = jobs_to_add_df.to_dict("records")
+                        jobs_to_add = [
+                            Job(
+                                job_id=r["job_id"],
+                                job_name=r["job_name"],
+                                user_name=r["user_name"],
+                                user_group=r["user_group"],
+                                queue=r["queue"],
+                                job_status=r["job_status"],
+                                nodes=r["nodes"],
+                                cores=r["cores"],
+                                memory=r["memory"],
+                                run_time_seconds=r["run_time_seconds"],
+                                queue_time=r["queue_time"],
+                                start_time=r["start_time"],
+                                elapse_limit_seconds=r["elapse_limit_seconds"],
+                                resource_type=r["resource_type"],
+                                wallet_name=r["wallet_name"],
+                                source_file=r["source_file"],
+                            )
+                            for r in records
+                        ]
+                        for i in range(0, len(jobs_to_add), _JOB_INSERT_CHUNK):
+                            db.add_all(jobs_to_add[i : i + _JOB_INSERT_CHUNK])
+                            db.commit()
                         print(f"Successfully loaded {len(jobs_to_add)} new jobs from {filename}.")
 
                 # Update or create ProcessedFile entry
@@ -231,12 +279,12 @@ def load_new_data(db: Session = None, specific_file: str = None, force: bool = F
                 processed_file_entry = db.query(ProcessedFile).filter(ProcessedFile.filename == filename).first()
                 if processed_file_entry:
                     processed_file_entry.checksum = current_checksum
-                    processed_file_entry.last_processed = datetime.utcnow()
                 else:
                     processed_file_entry = ProcessedFile(filename=filename, checksum=current_checksum)
                     db.add(processed_file_entry)
                 db.commit()
                 print(f"Updated processed file entry for {filename}.")
+                invalidate_report_caches()
 
             except Exception as e:
                 db.rollback()

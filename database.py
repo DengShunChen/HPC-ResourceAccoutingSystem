@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, BigInteger, Float, Boolean, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, BigInteger, Float, Boolean, ForeignKey, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from dotenv import load_dotenv
@@ -13,12 +13,39 @@ load_dotenv()
 DATABASE_FILE = os.getenv("DATABASE_FILE", "./resource_accounting.db")
 DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, pool_pre_ping=True)
+# Optimize engine with connection pooling
+# Set busy_timeout for all new connections via connect_args
+# This ensures all connections have the timeout set for better concurrency
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={
+        "check_same_thread": False,
+        "timeout": 5.0  # SQLite busy timeout in seconds (helps with concurrent access)
+    },
+    pool_pre_ping=True,
+    pool_size=10,  # Connection pool size
+    max_overflow=20,  # Maximum overflow connections
+    pool_recycle=3600,  # Recycle connections after 1 hour
+    echo=False  # Set to False in production
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Enable WAL mode for better concurrency
+# Optimize SQLite PRAGMA settings for better performance
 with engine.connect() as connection:
-    connection.execute(text("PRAGMA journal_mode=WAL;"))
+    # Busy timeout: wait up to 5 seconds for locks (helps with concurrent access)
+    connection.execute(text("PRAGMA busy_timeout = 5000;"))
+    # Cache size: 64MB (negative value means KB)
+    connection.execute(text("PRAGMA cache_size = -65536;"))
+    # Temporary database stored in memory for better performance
+    connection.execute(text("PRAGMA temp_store = MEMORY;"))
+    # Synchronous mode: balance between performance and safety
+    connection.execute(text("PRAGMA synchronous = NORMAL;"))
+    # Locking mode: NORMAL for better concurrency (WAL mode handles concurrency better)
+    connection.execute(text("PRAGMA locking_mode = NORMAL;"))
+    # Journal mode: WAL for better read/write concurrency
+    connection.execute(text("PRAGMA journal_mode = WAL;"))
+    # Foreign keys support
+    connection.execute(text("PRAGMA foreign_keys = ON;"))
     connection.commit()
 Base = declarative_base()
 
@@ -43,6 +70,23 @@ class Job(Base):
     resource_type = Column(String, index=True) # 'CPU' or 'GPU'
     wallet_name = Column(String, index=True, nullable=True) # New column for wallet name
     source_file = Column(String, index=True) # Added to track the source of the job data
+    
+    # Indexes (aligned with Alembic migration c5892216; avoid duplicate index=True on columns)
+    __table_args__ = (
+        Index('ix_jobs_start_time', 'start_time'),
+        Index('ix_jobs_queue_time', 'queue_time'),
+        Index('ix_jobs_start_time_resource_type', 'start_time', 'resource_type'),
+        # Index for time range queries with wallet
+        Index('ix_jobs_start_time_wallet_name', 'start_time', 'wallet_name'),
+        # Index for time range queries with user
+        Index('ix_jobs_start_time_user_name', 'start_time', 'user_name'),
+        # Index for multi-dimensional queries
+        Index('ix_jobs_start_time_user_group_resource_type', 'start_time', 'user_group', 'resource_type'),
+        # Covering index for aggregation queries (includes commonly aggregated columns)
+        Index('ix_jobs_start_time_resource_type_metrics', 'start_time', 'resource_type', 'run_time_seconds', 'nodes', 'cores'),
+        # Index for queue time queries
+        Index('ix_jobs_queue_time_start_time', 'queue_time', 'start_time'),
+    )
 
 class Wallet(Base):
     __tablename__ = "wallets"

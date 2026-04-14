@@ -8,6 +8,7 @@ from database import SessionLocal, Base, engine, ProcessedFile, Job # Import Bas
 from data_loader import load_new_data
 from auth import create_initial_admin_user, get_user, create_user, verify_password
 from queries import get_kpi_data, get_usage_over_time, get_filtered_jobs,     get_all_registered_users, set_user_quota, delete_user,     get_all_group_mappings, add_group_mapping, delete_group_mapping,     generate_accounting_report, create_wallet, delete_wallet, get_all_wallets,     add_group_to_wallet_mapping, delete_group_to_wallet_mapping, get_all_group_to_wallet_mappings,     add_user_to_wallet_mapping, delete_user_to_wallet_mapping, get_all_user_to_wallet_mappings
+from database_utils import analyze_database, vacuum_database, get_database_stats, explain_query_plan, format_size
 
 from alembic.config import Config
 from alembic import command
@@ -155,7 +156,9 @@ def alembic_migrate_command(message: Annotated[str, typer.Option(help="遷移訊
         raise typer.Exit(code=1)
 
 @app.command("alembic-upgrade", help="執行資料庫遷移。")
-def alembic_upgrade_command(revision: Annotated[str, typer.Option(help="目標版本 (head, base, 或特定版本號)")] = "head"):
+def alembic_upgrade_command(
+    revision: Annotated[str, typer.Option("--revision", "-r", help="目標版本 (head, base, 或特定版本號)")] = "head",
+):
     typer.secho(f"Upgrading database to revision {revision}...", fg=typer.colors.BLUE)
     try:
         alembic_cfg = get_alembic_config()
@@ -1084,6 +1087,143 @@ def manage_mapping_command(
     else:
         typer.secho("Invalid action. Use add, delete, or list.", fg=typer.colors.RED)
         raise typer.Exit(code=1)
+
+
+# --- Database Maintenance Commands ---
+
+@app.command("db-analyze", help="執行 ANALYZE 更新查詢優化器統計資訊。")
+def db_analyze_command():
+    """Execute ANALYZE to update query optimizer statistics."""
+    typer.secho("執行 ANALYZE 更新統計資訊...", fg=typer.colors.BLUE)
+    db = next(get_db())
+    try:
+        result = analyze_database(db)
+        if result.get("status") == "success":
+            typer.secho(f"ANALYZE 執行成功！", fg=typer.colors.GREEN)
+            typer.echo(f"  執行時間: {result.get('duration_seconds', 0):.2f} 秒")
+            typer.echo(f"  時間戳記: {result.get('timestamp', 'N/A')}")
+        else:
+            typer.secho(f"ANALYZE 執行失敗: {result.get('error', 'Unknown error')}", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+    except Exception as e:
+        typer.secho(f"執行 ANALYZE 時發生錯誤: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    finally:
+        db.close()
+
+
+@app.command("db-vacuum", help="執行 VACUUM 重新組織資料庫並回收空間。注意：此操作會鎖定資料庫，可能需要較長時間。")
+def db_vacuum_command():
+    """Execute VACUUM to reorganize the database and reclaim unused space."""
+    typer.secho("警告：VACUUM 操作會鎖定資料庫，可能需要較長時間。", fg=typer.colors.YELLOW)
+    confirm = typer.confirm("確定要繼續執行 VACUUM 嗎？")
+    if not confirm:
+        typer.secho("已取消操作。", fg=typer.colors.YELLOW)
+        raise typer.Exit(code=0)
+    
+    typer.secho("執行 VACUUM...", fg=typer.colors.BLUE)
+    try:
+        result = vacuum_database()
+        if result.get("status") == "success":
+            typer.secho(f"VACUUM 執行成功！", fg=typer.colors.GREEN)
+            typer.echo(f"  執行時間: {result.get('duration_seconds', 0):.2f} 秒")
+            size_before = result.get('size_before_bytes', 0)
+            size_after = result.get('size_after_bytes', 0)
+            size_reclaimed = result.get('size_reclaimed_bytes', 0)
+            typer.echo(f"  原始大小: {format_size(size_before)}")
+            typer.echo(f"  執行後大小: {format_size(size_after)}")
+            typer.echo(f"  回收空間: {format_size(size_reclaimed)}")
+            typer.echo(f"  時間戳記: {result.get('timestamp', 'N/A')}")
+        else:
+            typer.secho(f"VACUUM 執行失敗: {result.get('error', 'Unknown error')}", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+    except Exception as e:
+        typer.secho(f"執行 VACUUM 時發生錯誤: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+
+
+@app.command("db-stats", help="顯示資料庫統計資訊（表大小、記錄數、索引資訊等）。")
+def db_stats_command():
+    """Display comprehensive database statistics."""
+    typer.secho("正在收集資料庫統計資訊...", fg=typer.colors.BLUE)
+    db = next(get_db())
+    try:
+        stats = get_database_stats(db)
+        if stats.get("status") == "error":
+            typer.secho(f"獲取統計資訊時發生錯誤: {stats.get('error', 'Unknown error')}", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        
+        typer.secho("\n=== 資料庫統計資訊 ===\n", fg=typer.colors.CYAN)
+        typer.echo(f"資料庫檔案: {stats.get('database_file', 'N/A')}")
+        typer.echo(f"資料庫大小: {format_size(stats.get('database_size_bytes', 0))}")
+        
+        if 'database_pages' in stats:
+            typer.echo(f"資料庫頁數: {stats['database_pages']:,}")
+            typer.echo(f"頁面大小: {format_size(stats.get('page_size_bytes', 0))}")
+            typer.echo(f"計算大小: {format_size(stats.get('calculated_size_bytes', 0))}")
+        
+        # PRAGMA 設定
+        if stats.get('pragmas'):
+            typer.secho("\n--- PRAGMA 設定 ---", fg=typer.colors.CYAN)
+            for pragma, value in stats['pragmas'].items():
+                typer.echo(f"  {pragma}: {value}")
+        
+        # 表資訊
+        if stats.get('tables'):
+            typer.secho("\n--- 表資訊 ---", fg=typer.colors.CYAN)
+            for table_name, table_info in stats['tables'].items():
+                if 'error' not in table_info:
+                    row_count = table_info.get('row_count', 0)
+                    typer.echo(f"  {table_name}: {row_count:,} 筆記錄")
+                else:
+                    typer.echo(f"  {table_name}: 錯誤 - {table_info.get('error', 'Unknown')}")
+        
+        # 索引資訊
+        if stats.get('indexes'):
+            typer.secho("\n--- 索引資訊 ---", fg=typer.colors.CYAN)
+            for table_name, indexes in stats['indexes'].items():
+                typer.echo(f"  {table_name}:")
+                for idx in indexes:
+                    unique_str = " (唯一)" if idx.get('unique') else ""
+                    typer.echo(f"    - {idx['name']}{unique_str}: {', '.join(idx['columns'])}")
+        
+        typer.echo(f"\n時間戳記: {stats.get('timestamp', 'N/A')}")
+        
+    except Exception as e:
+        typer.secho(f"獲取統計資訊時發生錯誤: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    finally:
+        db.close()
+
+
+@app.command("explain-query", help="分析 SQL 查詢的執行計劃。")
+def explain_query_command(
+    query: Annotated[str, typer.Argument(help="要分析的 SQL 查詢語句")]
+):
+    """Analyze a SQL query's execution plan using EXPLAIN QUERY PLAN."""
+    typer.secho(f"分析查詢執行計劃...", fg=typer.colors.BLUE)
+    typer.echo(f"查詢: {query}\n")
+    db = next(get_db())
+    try:
+        plan = explain_query_plan(query, db)
+        if plan and 'error' in plan[0]:
+            typer.secho(f"查詢執行失敗: {plan[0]['error']}", fg=typer.colors.RED)
+            raise typer.Exit(code=1)
+        
+        typer.secho("--- 查詢執行計劃 ---", fg=typer.colors.CYAN)
+        for i, step in enumerate(plan, 1):
+            typer.echo(f"\n步驟 {i}:")
+            if step.get('detail'):
+                typer.echo(f"  詳細: {step['detail']}")
+            if step.get('from') is not None:
+                typer.echo(f"  來源: {step['from']}")
+            if step.get('order') is not None:
+                typer.echo(f"  順序: {step['order']}")
+    except Exception as e:
+        typer.secho(f"分析查詢時發生錯誤: {e}", fg=typer.colors.RED)
+        raise typer.Exit(code=1)
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":

@@ -98,12 +98,17 @@ PYTHONPATH=. pytest
 
 有關如何將應用程式部署到叢集的詳細步驟，請參考 `DEPLOY.md` 文件。
 
+### 6. 系統架構
+
+有關系統的詳細架構設計、資料流程、模組關係與業務邏輯說明，請參考 `ARCHITECTURE.md` 文件。
+
 ## 專案結構
 
 ```
 .env                  # 環境變數 (不提交到版本控制)
 .env.example          # 環境變數範例
 .gitignore            # Git 忽略文件
+ARCHITECTURE.md       # 系統架構與邏輯分析文檔
 DEPLOY.md             # 叢集部署指南
 GEMINI.md             # 專案開發藍圖與筆記
 README.md             # 專案說明文件
