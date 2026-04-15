@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, date
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from database import Base, Job, User, Quota, GroupMapping
+import queries
 from queries import get_kpi_data, get_usage_over_time, get_filtered_jobs, count_filtered_jobs, get_all_users, get_all_groups, get_all_queues,     get_all_registered_users, get_user_quota, set_user_quota, delete_user, get_all_group_mappings, add_group_mapping, delete_group_mapping,     generate_accounting_report, get_user_resource_usage_summary, get_job_start_date_bounds, invalidate_report_caches, REPORT_CACHE_GEN_REDIS_KEY
 from unittest.mock import patch, MagicMock
 import pandas as pd
@@ -63,6 +64,14 @@ def populate_jobs(in_memory_db):
 def test_invalidate_report_caches_increments_generation(mock_redis_client):
     invalidate_report_caches()
     mock_redis_client.incr.assert_called_with(REPORT_CACHE_GEN_REDIS_KEY)
+
+
+def test_invalidate_report_caches_updates_local_generation_snapshot(mock_redis_client):
+    """invalidate 成功時應同步本機世代，同程序內後續 cache 鍵立即用新 g。"""
+    queries._clear_report_cache_generation_local()
+    mock_redis_client.incr.return_value = 42
+    invalidate_report_caches()
+    assert queries._GEN_SNAPSHOT == 42
 
 
 def test_get_job_start_date_bounds(in_memory_db, populate_jobs):

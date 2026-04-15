@@ -258,15 +258,16 @@ def get_kpi_data(db: Session, start_date: date, end_date: date, user_name: str =
         func.sum(case((Job.job_status == "COMPLETED", 1), else_=0)).label("completed_jobs"),
     ).first()
 
-    if not agg:
+    # 聚合查詢通常仍回傳一列；僅在極端情況 .first() 為 None 時回傳零值
+    if agg is None:
         return {
-            "CPU": {"total_node_hours": 0, "total_jobs": 0, "avg_run_time_seconds": 0},
-            "GPU": {"total_core_hours": 0, "total_jobs": 0, "avg_run_time_seconds": 0},
+            "CPU": {"total_node_hours": 0.0, "total_jobs": 0, "avg_run_time_seconds": 0},
+            "GPU": {"total_core_hours": 0.0, "total_jobs": 0, "avg_run_time_seconds": 0},
             "overall_total_jobs": 0,
             "overall_avg_run_time": 0,
             "unique_users": 0,
             "avg_wait_time": 0,
-            "success_rate": 0,
+            "success_rate": 0.0,
         }
 
     cpu_ns = agg.cpu_node_seconds or 0
@@ -649,39 +650,9 @@ def delete_group_mapping(db: Session, mapping_id: int):
     return False
 
 
-# --- Group to Group Mappings ---
-from database import GroupToGroupMapping
-
-@cache_results(ttl_seconds=3600)
-def get_all_group_to_group_mappings(db: Session):
-    """Gets all group-to-group mappings."""
-    mappings = db.query(GroupToGroupMapping).all()
-    return [{'id': m.id, 'source_group': m.source_group, 'target_group': m.target_group} for m in mappings]
-
-def add_group_to_group_mapping(db: Session, source_group: str, target_group: str):
-    """Adds a new group-to-group mapping."""
-    existing_mapping = db.query(GroupToGroupMapping).filter(GroupToGroupMapping.source_group == source_group).first()
-    if existing_mapping:
-        raise ValueError(f"Mapping for source group '{source_group}' already exists.")
-
-    new_mapping = GroupToGroupMapping(source_group=source_group, target_group=target_group)
-    db.add(new_mapping)
-    db.commit()
-    db.refresh(new_mapping)
-    return new_mapping
-
-def delete_group_to_group_mapping(db: Session, mapping_id: int):
-    """Deletes a group-to-group mapping by ID."""
-    mapping = db.query(GroupToGroupMapping).filter(GroupToGroupMapping.id == mapping_id).first()
-    if mapping:
-        db.delete(mapping)
-        db.commit()
-        return True
-    return False
-
-
-# --- Report Generation (Placeholder) ---
+# --- Group to Group Mappings & Wallet（共用 model import）---
 from database import GroupToGroupMapping, Wallet, GroupToWalletMapping, UserToWalletMapping
+
 
 @cache_results(ttl_seconds=3600)
 def get_all_group_to_group_mappings(db: Session):
