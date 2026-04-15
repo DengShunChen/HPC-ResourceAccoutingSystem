@@ -46,10 +46,10 @@
 
 2.  **建立並啟用 Python 虛擬環境**:
     - **目的**: 建立一個獨立的 Python 環境，避免與系統全域套件衝突，確保專案的穩定與可轉移性。
-    - **建立**: 在專案根目錄下執行 `python3 -m venv venv`。
-    - **啟用 (macOS/Linux)**: 執行 `source venv/bin/activate`。
-    - **啟用 (Windows)**: 執行 `venv\Scripts\activate`。
-    - *啟用後，您的終端機提示字元前會出現 `(venv)` 字樣。*
+    - **建立**: 在專案根目錄下執行 `python3 -m venv .venv`（或 `uv sync` 建立 `.venv`）。
+    - **啟用 (macOS/Linux)**: 執行 `source .venv/bin/activate`。
+    - **啟用 (Windows)**: 執行 `.venv\Scripts\activate`。
+    - *啟用後，您的終端機提示字元前會出現 `(.venv)` 字樣。*
 
 3.  **設定 `.env` 檔案**:
     - **目的**: 儲存敏感資訊，並與程式碼分離。

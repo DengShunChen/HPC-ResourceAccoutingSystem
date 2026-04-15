@@ -17,5 +17,6 @@ dependencies = [
 ]
 
 # 應用程式專案（非可安裝套件）；uv sync 只管理環境與 lock，不發佈 wheel。
+# 鎖檔：uv lock（已納入 uv.lock 時，部署端 uv sync 可重現相同版本）。
 [tool.uv]
 package = false

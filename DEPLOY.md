@@ -21,14 +21,18 @@
     cd ResourceAccountingSystem
     ```
 
-2.  **建立並啟用 Python 虛擬環境**:
+2.  **建立 Python 環境並安裝相依套件**（擇一）:
+
+    **uv（建議，與 `uv.lock` 可重現安裝）** — 需先安裝 [uv](https://docs.astral.sh/uv/getting-started/installation/)：
     ```bash
-    python3 -m venv venv
-    source venv/bin/activate
+    uv sync
+    source .venv/bin/activate   # 或直接用 uv run …，不必 activate
     ```
 
-3.  **安裝相依套件**:
+    **傳統 venv + pip**（環境目錄固定為 `.venv`）:
     ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate
     pip install -r requirements.txt
     ```
 
@@ -40,7 +44,7 @@
 
 ### 快速初始化（可選）
 
-在專案根目錄執行（會建立 `venv`、安裝依賴、若無 `.env` 則從 `.env.example` 複製、並跑 `alembic upgrade head`）：
+在專案根目錄執行（若已安裝 **uv** 則 `uv sync`；否則建立 `.venv` 並以 pip 安裝；若無 `.env` 則從 `.env.example` 複製；並跑 `alembic upgrade head`）：
 
 ```bash
 bash scripts/deploy_setup.sh
@@ -70,7 +74,7 @@ bash scripts/deploy_setup.sh
 
 3.  **初始化/升級資料庫**:
     ```bash
-    source venv/bin/activate
+    source .venv/bin/activate
     alembic upgrade head
     ```
 
@@ -101,7 +105,7 @@ bash scripts/deploy_setup.sh
 
 2.  在檔案末尾加入一行；**路徑改為你的專案根目錄**。`data_loader` 會自動載入專案根目錄的 `.env`（內含 `LOG_DIRECTORY_PATH` 等），無須在 cron 裡重複 `export`。
     ```crontab
-    # 每小時第 5 分鐘載入日誌（使用 repo 內腳本，避免漏啟 venv）
+    # 每小時第 5 分鐘載入日誌（使用 repo 內腳本，固定 .venv/bin/python）
     5 * * * * /path/to/your/ResourceAccountingSystem/scripts/run_data_loader.sh >> /path/to/your/ResourceAccountingSystem/cron.log 2>&1
     ```
 
@@ -132,8 +136,8 @@ bash scripts/deploy_setup.sh
 ## 部署檢查清單
 
 - [ ] 程式碼已部署到叢集上的指定目錄。
-- [ ] Python 虛擬環境已建立並啟用。
-- [ ] `requirements.txt` 中的套件已安裝。
+- [ ] Python 虛擬環境 `.venv` 已建立（`uv sync` 或 `python3 -m venv .venv` + pip）並可執行 `.venv/bin/python`。
+- [ ] 相依套件已安裝（`uv.lock` / `uv sync` 或 `pip install -r requirements.txt`）。
 - [ ] `.env` 檔案已在叢集上建立，並包含正確的**絕對路徑**（至少 `DATABASE_FILE`、`LOG_DIRECTORY_PATH`）。
 - [ ] 日誌目錄已透過 `LOG_DIRECTORY_PATH`（或 `config.ini`）指向叢集上的**實際路徑**。
 - [ ] 資料庫已透過 `alembic upgrade head` 初始化。

@@ -2,7 +2,7 @@
 """
 簡易資料庫負載與環境診斷：協助區分 I/O、查詢時間與（SQLite）鎖競爭。
 
-用法（建議在專案 venv 下）:
+用法（建議在專案 .venv 下）:
   python scripts/profile_database.py
 
 若需對照多次載入或儀表操作，可在變更前後各執行一次比對輸出。

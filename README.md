@@ -35,12 +35,19 @@
     *   **SQLite**: 無需額外伺服器安裝，資料庫將是一個檔案。
     *   **Redis**: 確保 Redis 服務正在運行。如果尚未安裝，請參考 [Redis 官方文件](https://redis.io/docs/getting-started/installation/) 或使用 Homebrew (macOS): `brew install redis`。
 
-2.  **建立並啟用 Python 虛擬環境**:
+2.  **建立並啟用 Python 虛擬環境**（擇一）:
 
+    **uv（建議）** — 在專案根目錄會建立 `.venv`（見 `uv.lock`）:
     ```bash
-    python3 -m venv venv
-    source venv/bin/activate  # macOS/Linux
-    # venv\Scripts\activate   # Windows
+    uv sync
+    source .venv/bin/activate   # macOS/Linux；或略過，改用 uv run …
+    ```
+
+    **標準庫 venv + pip**（目錄固定為 `.venv`）:
+    ```bash
+    python3 -m venv .venv
+    source .venv/bin/activate  # macOS/Linux
+    # .venv\Scripts\activate   # Windows
     ```
 
 3.  **設定 `.env` 檔案**:
@@ -53,7 +60,7 @@
 
 4.  **安裝相依套件**（擇一）:
 
-    **pip（傳統）**
+    **pip（傳統，須已 `source .venv/bin/activate`）**
 
     ```bash
     pip install -r requirements.txt
@@ -115,7 +122,8 @@ python data_loader.py
 ### 4. 運行測試
 
 ```bash
-PYTHONPATH=. pytest
+PYTHONPATH=. .venv/bin/python -m pytest
+# 或已 activate .venv 時: PYTHONPATH=. pytest
 ```
 
 ### 5. 叢集部署
@@ -163,7 +171,7 @@ tests/                # 單元測試
 ├── test_data_loader.py
 ├── test_database.py
 └── test_queries.py
-venv/                 # Python 虛擬環境 (已在 .gitignore 中)
+.venv/                # Python 虛擬環境 (已在 .gitignore 中)
 系統登入.py             # Streamlit GUI 登入主程式
 ```
 
