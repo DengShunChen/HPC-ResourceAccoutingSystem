@@ -218,72 +218,81 @@ def _get_resource_seconds_expression():
 @cache_results(ttl_seconds=120)
 def get_kpi_data(db: Session, start_date: date, end_date: date, user_name: str = None, user_group: str = None, queue: str = None, wallet_name: str = None):
     """Calculates key performance indicators (KPIs).
-    
-    Optimized to use range queries on indexed start_time column.
+
+    單次聚合掃描（CASE 分攤 CPU/GPU/全體），避免舊版三個 .first() 對同一篩選範圍掃表三次。
     """
     # 半開區間 [start_date, end_date+1) 涵蓋 end_date 整日
-    base_query = db.query(Job).filter(
+    q = db.query(Job).filter(
         Job.start_time >= start_date,
-        Job.start_time < (end_date + timedelta(days=1))
+        Job.start_time < (end_date + timedelta(days=1)),
     )
-
-    # Apply filters
     if user_name and user_name != "(全部)":
-        base_query = base_query.filter(Job.user_name == user_name)
+        q = q.filter(Job.user_name == user_name)
     if user_group and user_group != "(全部)":
-        base_query = base_query.filter(Job.user_group == user_group)
+        q = q.filter(Job.user_group == user_group)
     if queue and queue != "(全部)":
-        base_query = base_query.filter(Job.queue == queue)
+        q = q.filter(Job.queue == queue)
     if wallet_name and wallet_name != "(全部)":
-        base_query = base_query.filter(Job.wallet_name == wallet_name)
+        q = q.filter(Job.wallet_name == wallet_name)
 
-    # Perform aggregations
-    # CPU aggregation
-    cpu_agg_query = base_query.filter(Job.resource_type == 'CPU').with_entities(
-        func.sum(Job.run_time_seconds * Job.nodes).label('total_node_seconds'),
-        func.count(Job.id).label('total_jobs'),
-        func.avg(Job.run_time_seconds).label('avg_run_time_seconds')
-    )
-    # GPU aggregation
-    gpu_agg_query = base_query.filter(Job.resource_type == 'GPU').with_entities(
-        func.sum(Job.run_time_seconds * Job.cores).label('total_core_seconds'),
-        func.count(Job.id).label('total_jobs'),
-        func.avg(Job.run_time_seconds).label('avg_run_time_seconds')
-    )
+    ws = wait_seconds_between(db, Job.start_time, Job.queue_time)
+    agg = q.with_entities(
+        func.sum(
+            case((Job.resource_type == "CPU", Job.run_time_seconds * Job.nodes), else_=0)
+        ).label("cpu_node_seconds"),
+        func.sum(case((Job.resource_type == "CPU", 1), else_=0)).label("cpu_jobs"),
+        func.avg(
+            case((Job.resource_type == "CPU", Job.run_time_seconds), else_=None)
+        ).label("cpu_avg_rt"),
+        func.sum(
+            case((Job.resource_type == "GPU", Job.run_time_seconds * Job.cores), else_=0)
+        ).label("gpu_core_seconds"),
+        func.sum(case((Job.resource_type == "GPU", 1), else_=0)).label("gpu_jobs"),
+        func.avg(
+            case((Job.resource_type == "GPU", Job.run_time_seconds), else_=None)
+        ).label("gpu_avg_rt"),
+        func.count(Job.id).label("total_jobs"),
+        func.avg(Job.run_time_seconds).label("avg_run_time"),
+        func.count(func.distinct(Job.user_name)).label("unique_users"),
+        func.avg(ws).label("avg_wait_time"),
+        func.sum(case((Job.job_status == "COMPLETED", 1), else_=0)).label("completed_jobs"),
+    ).first()
 
-    overall_agg_query = base_query.with_entities(
-        func.count(Job.id).label('total_jobs'),
-        func.avg(Job.run_time_seconds).label('avg_run_time'),
-        func.count(func.distinct(Job.user_name)).label('unique_users'),
-        func.avg(wait_seconds_between(db, Job.start_time, Job.queue_time)).label('avg_wait_time'),
-        func.sum(case((Job.job_status == 'COMPLETED', 1), else_=0)).label('completed_jobs')
-    )
+    if not agg:
+        return {
+            "CPU": {"total_node_hours": 0, "total_jobs": 0, "avg_run_time_seconds": 0},
+            "GPU": {"total_core_hours": 0, "total_jobs": 0, "avg_run_time_seconds": 0},
+            "overall_total_jobs": 0,
+            "overall_avg_run_time": 0,
+            "unique_users": 0,
+            "avg_wait_time": 0,
+            "success_rate": 0,
+        }
 
-    cpu_results = cpu_agg_query.first()
-    gpu_results = gpu_agg_query.first()
-    overall_results = overall_agg_query.first()
+    cpu_ns = agg.cpu_node_seconds or 0
+    gpu_cs = agg.gpu_core_seconds or 0
+    total_jobs = int(agg.total_jobs or 0)
+    completed = int(agg.completed_jobs or 0) if agg.completed_jobs is not None else 0
 
-    kpis = {
-        'CPU': {'total_node_hours': 0, 'total_jobs': 0, 'avg_run_time_seconds': 0},
-        'GPU': {'total_core_hours': 0, 'total_jobs': 0, 'avg_run_time_seconds': 0},
-        'overall_total_jobs': overall_results.total_jobs if overall_results else 0,
-        'overall_avg_run_time': (overall_results.avg_run_time or 0) if overall_results else 0,
-        'unique_users': overall_results.unique_users if overall_results else 0,
-        'avg_wait_time': (overall_results.avg_wait_time or 0) if overall_results else 0,
-        'success_rate': (overall_results.completed_jobs / overall_results.total_jobs * 100) if (overall_results and overall_results.total_jobs > 0 and overall_results.completed_jobs is not None) else 0,
+    return {
+        "CPU": {
+            "total_node_hours": float(cpu_ns) / 3600.0,
+            "total_jobs": int(agg.cpu_jobs or 0),
+            "avg_run_time_seconds": agg.cpu_avg_rt or 0,
+        },
+        "GPU": {
+            "total_core_hours": float(gpu_cs) / 3600.0,
+            "total_jobs": int(agg.gpu_jobs or 0),
+            "avg_run_time_seconds": agg.gpu_avg_rt or 0,
+        },
+        "overall_total_jobs": total_jobs,
+        "overall_avg_run_time": (agg.avg_run_time or 0) if agg.avg_run_time is not None else 0,
+        "unique_users": int(agg.unique_users or 0) if agg.unique_users is not None else 0,
+        "avg_wait_time": (agg.avg_wait_time or 0) if agg.avg_wait_time is not None else 0,
+        "success_rate": (completed / total_jobs * 100.0)
+        if (total_jobs > 0 and completed is not None)
+        else 0.0,
     }
-
-    if cpu_results and cpu_results.total_node_seconds is not None:
-        kpis['CPU']['total_node_hours'] = cpu_results.total_node_seconds / 3600
-        kpis['CPU']['total_jobs'] = cpu_results.total_jobs
-        kpis['CPU']['avg_run_time_seconds'] = cpu_results.avg_run_time_seconds
-
-    if gpu_results and gpu_results.total_core_seconds is not None:
-        kpis['GPU']['total_core_hours'] = gpu_results.total_core_seconds / 3600
-        kpis['GPU']['total_jobs'] = gpu_results.total_jobs
-        kpis['GPU']['avg_run_time_seconds'] = gpu_results.avg_run_time_seconds
-
-    return kpis
 
 @cache_results(ttl_seconds=600)
 def get_usage_over_time(db: Session, start_date: date, end_date: date, user_name: str = None, user_group: str = None, queue: str = None, wallet_name: str = None, time_granularity: str = 'daily'):

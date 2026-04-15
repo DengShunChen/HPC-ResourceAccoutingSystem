@@ -1,4 +1,5 @@
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 import pandas as pd
 import altair as alt
@@ -26,6 +27,42 @@ total_cpu_nodes = config.getint("cluster", "total_cpu_nodes", fallback=1)
 total_gpu_cores = config.getint("cluster", "total_gpu_cores", fallback=1)
 
 st.set_page_config(page_title="使用者儀表板", layout="wide")
+
+
+def _fetch_overview_kpi_and_usage(
+    start_date,
+    end_date,
+    user_name,
+    user_group,
+    queue,
+    effective_wallet_name,
+    time_granularity,
+):
+    """KPI 與使用趨勢各用獨立 Session／連線並行查詢（SQLite WAL 下多讀通常可疊加 I/O）。"""
+
+    def _kpi():
+        with db_session_scope() as db:
+            return get_kpi_data(
+                db, start_date, end_date, user_name, user_group, queue, effective_wallet_name
+            )
+
+    def _usage():
+        with db_session_scope() as db:
+            return get_usage_over_time(
+                db,
+                start_date,
+                end_date,
+                user_name,
+                user_group,
+                queue,
+                effective_wallet_name,
+                time_granularity,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fk = pool.submit(_kpi)
+        fu = pool.submit(_usage)
+        return fk.result(), fu.result()
 
 
 def create_donut_chart(df, theta_col, color_col, title, color_range, tooltip_override=None):
@@ -112,10 +149,15 @@ with db_session_scope() as db_session:
                 " 若只要看整體走勢，建議改選「每月」或縮短日期。"
             )
 
-        with st.spinner("正在載入 KPI 與使用趨勢…"):
-            kpi_data = get_kpi_data(db_session, start_date, end_date, user_name, user_group, queue, effective_wallet_name)
-            usage_data = get_usage_over_time(
-                db_session, start_date, end_date, user_name, user_group, queue, effective_wallet_name, time_granularity
+        with st.spinner("並行載入 KPI 與使用趨勢…"):
+            kpi_data, usage_data = _fetch_overview_kpi_and_usage(
+                start_date,
+                end_date,
+                user_name,
+                user_group,
+                queue,
+                effective_wallet_name,
+                time_granularity,
             )
 
         with st.container(border=True):

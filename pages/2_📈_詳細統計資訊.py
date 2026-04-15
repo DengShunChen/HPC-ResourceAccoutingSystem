@@ -1,4 +1,5 @@
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import altair as alt
 
@@ -20,6 +21,89 @@ from streamlit_data import (
 from streamlit_date_defaults import normalize_start_end_dates, sidebar_default_date_range
 
 st.set_page_config(page_title="詳細統計資訊", layout="wide")
+
+
+def _fetch_leaderboard_bundle(
+    start_date, end_date, user_name, user_group, queue, effective_wallet_name, top_n
+):
+    def _users():
+        with db_session_scope() as db:
+            return get_top_users_by_core_hours(
+                db, start_date, end_date, user_group, queue, effective_wallet_name, limit=top_n
+            )
+
+    def _groups():
+        with db_session_scope() as db:
+            return get_top_groups_by_core_hours(
+                db, start_date, end_date, user_name, queue, effective_wallet_name, limit=top_n
+            )
+
+    def _wallets():
+        with db_session_scope() as db:
+            return get_top_wallets_by_core_hours(db, start_date, end_date, limit=top_n)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fu, fg, fw = pool.submit(_users), pool.submit(_groups), pool.submit(_wallets)
+        return fu.result(), fg.result(), fw.result()
+
+
+def _fetch_failure_rate_bundle(start_date, end_date, top_n):
+    def _by_group():
+        with db_session_scope() as db:
+            return get_failure_rate_by_group(db, start_date, end_date, limit=top_n)
+
+    def _by_user():
+        with db_session_scope() as db:
+            return get_failure_rate_by_user(db, start_date, end_date, limit=top_n)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1, f2 = pool.submit(_by_group), pool.submit(_by_user)
+        return f1.result(), f2.result()
+
+
+def _fetch_distribution_bundle(
+    start_date, end_date, user_name, user_group, queue, effective_wallet_name
+):
+    def _status():
+        with db_session_scope() as db:
+            return get_job_status_distribution(
+                db, start_date, end_date, user_name, user_group, queue, effective_wallet_name
+            )
+
+    def _runtime():
+        with db_session_scope() as db:
+            return get_average_job_runtime_by_queue(
+                db, start_date, end_date, user_name, user_group, effective_wallet_name
+            )
+
+    def _wait():
+        with db_session_scope() as db:
+            return get_average_wait_time_by_queue(db, start_date, end_date)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        fa, fb, fc = pool.submit(_status), pool.submit(_runtime), pool.submit(_wait)
+        return fa.result(), fb.result(), fc.result()
+
+
+def _fetch_wallet_usage_bundle(
+    start_date, end_date, user_name, user_group, queue, effective_wallet_name
+):
+    def _cpu():
+        with db_session_scope() as db:
+            return get_wallet_usage_by_resource_type(
+                db, start_date, end_date, "CPU", user_name, user_group, queue, effective_wallet_name
+            )
+
+    def _gpu():
+        with db_session_scope() as db:
+            return get_wallet_usage_by_resource_type(
+                db, start_date, end_date, "GPU", user_name, user_group, queue, effective_wallet_name
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fc, fg = pool.submit(_cpu), pool.submit(_gpu)
+        return fc.result(), fg.result()
+
 
 st.title("📈 詳細統計資訊")
 st.caption("各統計區塊預設不載入；勾選「載入此區塊資料」後才查詢，可大幅加快進入本頁與調整篩選時的速度。")
@@ -153,11 +237,12 @@ with db_session_scope() as db_session:
     with st.expander("🏆 資源使用排行榜", expanded=False):
         load_lb = st.checkbox("載入此區塊資料", key="stats2_load_leaderboard")
         if load_lb:
+            with st.spinner("並行載入排行榜（使用者／群組／錢包）…"):
+                top_users, top_groups, top_wallets = _fetch_leaderboard_bundle(
+                    start_date, end_date, user_name, user_group, queue, effective_wallet_name, top_n
+                )
             col1, col2, col3 = st.columns(3)
             with col1:
-                top_users = get_top_users_by_core_hours(
-                    db_session, start_date, end_date, user_group, queue, effective_wallet_name, limit=top_n
-                )
                 if top_users:
                     st.altair_chart(
                         create_bar_chart(
@@ -174,9 +259,6 @@ with db_session_scope() as db_session:
                     st.info("沒有使用者資料可供顯示。")
 
             with col2:
-                top_groups = get_top_groups_by_core_hours(
-                    db_session, start_date, end_date, user_name, queue, effective_wallet_name, limit=top_n
-                )
                 if top_groups:
                     st.altair_chart(
                         create_bar_chart(
@@ -193,7 +275,6 @@ with db_session_scope() as db_session:
                     st.info("沒有群組資料可供顯示。")
 
             with col3:
-                top_wallets = get_top_wallets_by_core_hours(db_session, start_date, end_date, limit=top_n)
                 if top_wallets:
                     st.altair_chart(
                         create_bar_chart(
@@ -214,9 +295,12 @@ with db_session_scope() as db_session:
     with st.expander("📉 任務失敗率分析", expanded=False):
         load_fr = st.checkbox("載入此區塊資料", key="stats2_load_failrate")
         if load_fr:
+            with st.spinner("並行載入失敗率（群組／使用者）…"):
+                group_failure_rate, user_failure_rate = _fetch_failure_rate_bundle(
+                    start_date, end_date, top_n
+                )
             col1, col2 = st.columns(2)
             with col1:
-                group_failure_rate = get_failure_rate_by_group(db_session, start_date, end_date, limit=top_n)
                 if group_failure_rate:
                     df_group_rate = pd.DataFrame(group_failure_rate)
                     df_group_rate["failure_rate_str"] = df_group_rate["failure_rate"].apply(lambda x: f"{x:.2f}%")
@@ -239,7 +323,6 @@ with db_session_scope() as db_session:
                 else:
                     st.info("沒有群組失敗率資料可供顯示。")
             with col2:
-                user_failure_rate = get_failure_rate_by_user(db_session, start_date, end_date, limit=top_n)
                 if user_failure_rate:
                     df_user_rate = pd.DataFrame(user_failure_rate)
                     df_user_rate["failure_rate_str"] = df_user_rate["failure_rate"].apply(lambda x: f"{x:.2f}%")
@@ -267,11 +350,12 @@ with db_session_scope() as db_session:
     with st.expander("📊 使用分佈與效率", expanded=False):
         load_dist = st.checkbox("載入此區塊資料", key="stats2_load_distribution")
         if load_dist:
+            with st.spinner("並行載入分佈與效率（狀態／運行時間／等待時間）…"):
+                job_status_dist, avg_runtime, avg_waittime = _fetch_distribution_bundle(
+                    start_date, end_date, user_name, user_group, queue, effective_wallet_name
+                )
             col1, col2, col3 = st.columns(3)
             with col1:
-                job_status_dist = get_job_status_distribution(
-                    db_session, start_date, end_date, user_name, user_group, queue, effective_wallet_name
-                )
                 if job_status_dist:
                     df_status = pd.DataFrame(job_status_dist)
                     total_jobs = df_status["job_count"].sum()
@@ -294,9 +378,6 @@ with db_session_scope() as db_session:
                     st.info("沒有任務狀態資料可供顯示。")
 
             with col2:
-                avg_runtime = get_average_job_runtime_by_queue(
-                    db_session, start_date, end_date, user_name, user_group, effective_wallet_name
-                )
                 if avg_runtime:
                     st.altair_chart(
                         create_bar_chart(
@@ -313,7 +394,6 @@ with db_session_scope() as db_session:
                     st.info("沒有佇列效率資料可供顯示。")
 
             with col3:
-                avg_waittime = get_average_wait_time_by_queue(db_session, start_date, end_date)
                 if avg_waittime:
                     st.altair_chart(
                         create_bar_chart(
@@ -334,11 +414,12 @@ with db_session_scope() as db_session:
     with st.expander("💰 錢包與佇列使用量", expanded=False):
         load_wallet = st.checkbox("載入此區塊資料", key="stats2_load_wallet")
         if load_wallet:
+            with st.spinner("並行載入錢包用量（CPU／GPU）…"):
+                cpu_wallet_usage, gpu_wallet_usage = _fetch_wallet_usage_bundle(
+                    start_date, end_date, user_name, user_group, queue, effective_wallet_name
+                )
             col1, col2 = st.columns(2)
             with col1:
-                cpu_wallet_usage = get_wallet_usage_by_resource_type(
-                    db_session, start_date, end_date, "CPU", user_name, user_group, queue, effective_wallet_name
-                )
                 if cpu_wallet_usage:
                     df = pd.DataFrame(cpu_wallet_usage)
                     total = df["core_hours"].sum()
@@ -348,9 +429,6 @@ with db_session_scope() as db_session:
                     st.info("沒有 CPU 錢包資料可供顯示。")
 
             with col2:
-                gpu_wallet_usage = get_wallet_usage_by_resource_type(
-                    db_session, start_date, end_date, "GPU", user_name, user_group, queue, effective_wallet_name
-                )
                 if gpu_wallet_usage:
                     df = pd.DataFrame(gpu_wallet_usage)
                     total = df["core_hours"].sum()
