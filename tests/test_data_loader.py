@@ -18,12 +18,14 @@ def in_memory_db():
 
 @pytest.fixture
 def mock_config():
-    with patch('data_loader.configparser.ConfigParser') as MockConfigParser:
-        mock_config_instance = MockConfigParser.return_value
-        mock_config_instance.get.side_effect = lambda section, option: {
-            'data': {'log_directory_path': '/tmp/test_logs'},
-            'log_schema': {'column_names': 'JobID,JobName,UserName,UserGroup,Queue,JobStatus,Nodes,Cores,Memory,RunTime,RunTimeSeconds,QueDateYear,QueDateMonth,QueDateDay,QueDateHour,QueDateMinute,QueDateSecond,StartDateYear,StartDateMonth,StartDateDay,StartDateHour,StartDateMinute,StartDateSecond,ElapseLimiteSecond'}
-        }[section][option]
+    mock_config_instance = MagicMock()
+    mock_config_instance.get.side_effect = lambda section, option: {
+        "data": {"log_directory_path": "/tmp/test_logs"},
+        "log_schema": {
+            "column_names": "JobID,JobName,UserName,UserGroup,Queue,JobStatus,Nodes,Cores,Memory,RunTime,RunTimeSeconds,QueDateYear,QueDateMonth,QueDateDay,QueDateHour,QueDateMinute,QueDateSecond,StartDateYear,StartDateMonth,StartDateDay,StartDateHour,StartDateMinute,StartDateSecond,ElapseLimiteSecond"
+        },
+    }[section][option]
+    with patch("data_loader.get_config", return_value=mock_config_instance):
         yield mock_config_instance
 
 @pytest.fixture

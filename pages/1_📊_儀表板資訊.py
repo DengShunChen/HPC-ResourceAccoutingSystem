@@ -3,8 +3,14 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 import pandas as pd
 import altair as alt
-import configparser
 
+from cluster_config import (
+    read_config,
+    list_cluster_profiles,
+    resolve_cluster_section,
+    get_cluster_capacity,
+    section_to_profile_id,
+)
 from database import db_session_scope
 from queries import (
     get_kpi_data,
@@ -20,11 +26,13 @@ from streamlit_data import (
 )
 from streamlit_date_defaults import normalize_start_end_dates, sidebar_default_date_range
 
-# --- Load Config ---
-config = configparser.ConfigParser()
-config.read("config.ini")
-total_cpu_nodes = config.getint("cluster", "total_cpu_nodes", fallback=1)
-total_gpu_cores = config.getint("cluster", "total_gpu_cores", fallback=1)
+# --- Load Config（多叢集見 config.ini；路徑/日誌目錄可用環境變數覆寫）---
+config = read_config()
+_cluster_profiles = list_cluster_profiles(config)
+_default_section = resolve_cluster_section(config)
+_default_profile_id = section_to_profile_id(_default_section) or (
+    _cluster_profiles[0][0] if _cluster_profiles else "default"
+)
 
 st.set_page_config(page_title="使用者儀表板", layout="wide")
 
@@ -86,13 +94,34 @@ def create_donut_chart(df, theta_col, color_col, title, color_range, tooltip_ove
     return chart
 
 
-st.title(f"📊 {config.get('cluster', 'cluster_name', fallback='HPC')} 使用者儀表板")
-
 # --- Database Session ---
 with db_session_scope() as db_session:
 
     # --- Sidebar Filters ---
     st.sidebar.header("篩選條件")
+
+    if len(_cluster_profiles) > 1:
+        _ids = [p[0] for p in _cluster_profiles]
+        _labels = {cid: f"{name} ({cid})" for cid, name in _cluster_profiles}
+        if "dashboard_cluster_profile_id" not in st.session_state:
+            st.session_state["dashboard_cluster_profile_id"] = (
+                _default_profile_id if _default_profile_id in _ids else _ids[0]
+            )
+        _pick = st.sidebar.selectbox(
+            "叢集組態",
+            options=_ids,
+            format_func=lambda i: _labels.get(i, i),
+            key="dashboard_cluster_profile_id",
+        )
+        _cluster_section = "cluster" if _pick == "default" else f"cluster_{_pick}"
+    else:
+        _cluster_section = _default_section
+
+    cluster_display_name, total_cpu_nodes, total_gpu_cores = get_cluster_capacity(
+        config, section=_cluster_section
+    )
+
+    st.title(f"📊 {cluster_display_name} 使用者儀表板")
 
     initial_start_date, initial_end_date = get_job_start_date_bounds(db_session)
     default_start, _ = sidebar_default_date_range(initial_start_date, initial_end_date)

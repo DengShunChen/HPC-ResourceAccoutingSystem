@@ -34,40 +34,43 @@
 
 ---
 
-## 階段二：設定檔配置
+## 階段二：設定檔配置（建議「只動環境變數」，避免手改 repo）
 
-**這是部署中最關鍵的一步，請務必使用絕對路徑！**
+**路徑請用絕對路徑。**
 
-1.  **設定環境變數 (`.env`)**:
-    建立 `.env` 檔案，並填寫以下內容。
+### 快速初始化（可選）
+
+在專案根目錄執行（會建立 `venv`、安裝依賴、若無 `.env` 則從 `.env.example` 複製、並跑 `alembic upgrade head`）：
+
+```bash
+bash scripts/deploy_setup.sh
+```
+
+### 手動設定
+
+1.  **環境變數 (`.env`)** — 部署時**優先**只維護此檔，不必改 `config.ini` 內的 placeholder：
     ```bash
+    cp .env.example .env
     nano .env
     ```
-    檔案內容 (請替換為您的實際路徑):
+    至少設定（範例，請替換為實際絕對路徑）：
     ```env
-    DATABASE_FILE="/path/to/your/ResourceAccountingSystem/resource_accounting.db"
-    REDIS_HOST="127.0.0.1"
-    REDIS_PORT="6379"
+    DATABASE_FILE=/path/to/your/ResourceAccountingSystem/resource_accounting.db
+    LOG_DIRECTORY_PATH=/path/to/your/cluster_job_logs
+    REDIS_HOST=127.0.0.1
+    REDIS_PORT=6379
     ```
+    選用：
+    - `HPC_ACCOUNTING_CONFIG`：自訂 `config.ini` 路徑（預設為專案根目錄的 `config.ini`）。
+    - `CLUSTER_ID`：強制指定邏輯叢集 id（覆寫 hostname / `active_cluster`）。
+    - 多叢集時，`config.ini` 內各 `[cluster_<id>]` 的 `host_aliases` 可讓服務節點依 **hostname** 自動對應，減少每台手動設 `CLUSTER_ID`。
 
-2.  **設定應用程式組態 (`config.ini`)**:
-    編輯 `config.ini`，確保 `log_directory_path` 指向叢集上**實際存放 `.out` 日誌檔的目錄**。
-    ```bash
-    nano config.ini
-    ```
-    檔案內容 (請替換為您的實際路徑):
-    ```ini
-    [data]
-    log_directory_path = /path/to/your/cluster_job_logs/
-    
-    [log_schema]
-    # ... (其他設定保持不變)
-    ```
+2.  **`config.ini`**（可選）:
+    若已設定 `LOG_DIRECTORY_PATH`，則**不需要**再改 `[data] log_directory_path`。僅在需調整叢集容量、`host_aliases` 或 `column_names` 時編輯 `config.ini`。
 
 3.  **初始化/升級資料庫**:
-    執行 Alembic 指令，根據程式碼中的模型建立或更新資料庫檔案及資料表。
     ```bash
-    # 在虛擬環境 (venv) 已啟用的狀態下執行
+    source venv/bin/activate
     alembic upgrade head
     ```
 
@@ -96,11 +99,10 @@
 
 1.  執行 `crontab -e` 來編輯您的排程任務。
 
-2.  在檔案末尾加入以下這一行，**請務必將所有路徑替換成您的絕對路徑**。
+2.  在檔案末尾加入一行；**路徑改為你的專案根目錄**。`data_loader` 會自動載入專案根目錄的 `.env`（內含 `LOG_DIRECTORY_PATH` 等），無須在 cron 裡重複 `export`。
     ```crontab
-    # 每一小時的第 5 分鐘，執行資源帳務系統的資料載入腳本
-    # 將標準輸出和錯誤輸出都附加到 cron.log 檔案中，方便追蹤
-    5 * * * * cd /path/to/your/ResourceAccountingSystem && source venv/bin/activate && python data_loader.py >> /path/to/your/ResourceAccountingSystem/cron.log 2>&1
+    # 每小時第 5 分鐘載入日誌（使用 repo 內腳本，避免漏啟 venv）
+    5 * * * * /path/to/your/ResourceAccountingSystem/scripts/run_data_loader.sh >> /path/to/your/ResourceAccountingSystem/cron.log 2>&1
     ```
 
 ---
@@ -132,8 +134,8 @@
 - [ ] 程式碼已部署到叢集上的指定目錄。
 - [ ] Python 虛擬環境已建立並啟用。
 - [ ] `requirements.txt` 中的套件已安裝。
-- [ ] `.env` 檔案已在叢集上建立，並包含正確的**絕對路徑**。
-- [ ] `config.ini` 中的日誌路徑已更新為叢集上的**實際路徑**。
+- [ ] `.env` 檔案已在叢集上建立，並包含正確的**絕對路徑**（至少 `DATABASE_FILE`、`LOG_DIRECTORY_PATH`）。
+- [ ] 日誌目錄已透過 `LOG_DIRECTORY_PATH`（或 `config.ini`）指向叢集上的**實際路徑**。
 - [ ] 資料庫已透過 `alembic upgrade head` 初始化。
 - [ ] Redis 服務已在背景啟動。
 - [ ] `cron` 排程任務已設定，並指向正確的**絕對路徑**。

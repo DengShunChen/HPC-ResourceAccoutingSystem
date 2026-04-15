@@ -1,9 +1,11 @@
 import os
 import pandas as pd
-import configparser
 import hashlib
+from dotenv import load_dotenv
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
+load_dotenv()
 
 from database import (
     SessionLocal,
@@ -18,6 +20,7 @@ from database import (
 )
 from queries import invalidate_report_caches
 from auth import get_password_hash
+from cluster_config import read_config
 
 # 單檔大量寫入時分段 commit；bulk_insert_mappings 無完整 ORM 實例，可略放大 chunk
 _JOB_INSERT_CHUNK = 10000
@@ -76,9 +79,8 @@ def _analyze_jobs_table(db: Session) -> None:
 
 
 def get_config():
-    config = configparser.ConfigParser()
-    config.read('config.ini')
-    return config
+    """與 Streamlit 共用：路徑可由 HPC_ACCOUNTING_CONFIG、日誌目錄可由 LOG_DIRECTORY_PATH 覆寫。"""
+    return read_config()
 
 def _bulk_ensure_wallets_users(db: Session, jobs_df: pd.DataFrame) -> None:
     """預先批次建立本批 jobs 需要的 Wallet / User，避免逐列查詢與 commit。"""
